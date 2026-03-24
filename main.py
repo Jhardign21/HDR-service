@@ -59,8 +59,8 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
 
 def build_sky_mask(img: np.ndarray) -> np.ndarray:
     """
-    Detect sky only at the very top of the image.
-    Strict thresholds to avoid replacing interior walls/ceilings.
+    Detect sky by seeding only from the very top rows of the image.
+    Prevents white walls/snow from being mistaken for sky.
     """
     h, w = img.shape[:2]
 
@@ -73,34 +73,31 @@ def build_sky_mask(img: np.ndarray) -> np.ndarray:
     min_c = np.minimum(np.minimum(b, g), r)
     chroma = max_c - min_c
 
-    # Much stricter: very bright AND very neutral (white/grey blown sky)
-    # OR clearly blue-dominant (actual blue sky)
-    blue_sky = (b > r + 20) & (b > g + 5) & (brightness > 140)
-    blown_sky = (brightness > 200) & (chroma < 30)
+    blue_sky  = (b > r + 15) & (b > g + 5) & (brightness > 100)
+    blown_sky = (brightness > 210) & (chroma < 20)
+    sky_like  = (blue_sky | blown_sky).astype(np.uint8) * 255
 
-    sky_like = (blue_sky | blown_sky).astype(np.uint8) * 255
+    # Build seed mask: ONLY use the very top 5% of the image as flood-fill seeds
+    # This prevents white house walls from becoming seeds
+    seed_zone = int(h * 0.05)
+    seed_mask = sky_like.copy()
+    seed_mask[seed_zone:, :] = 0   # clear everything below top 5%
 
-    # Only consider top 35% of image for sky seeds
-    sky_like[int(h * 0.35):, :] = 0
-
-    # Morphological close to bridge small gaps
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    sky_like = cv2.morphologyEx(sky_like, cv2.MORPH_CLOSE, k)
-
-    # Flood fill only from top edge pixels that are sky-like
+    # Flood fill from every top-edge pixel that qualifies as sky
+    canvas = sky_like.copy()
     filled = np.zeros((h + 2, w + 2), np.uint8)
     for x in range(w):
-        if sky_like[0, x] == 255:
-            cv2.floodFill(sky_like, filled, (x, 0), 128)
+        if seed_mask[0, x] > 0:
+            cv2.floodFill(canvas, filled, (x, 0), 128,
+                          loDiff=(15, 15, 15), upDiff=(15, 15, 15))
 
-    # Extract flooded region
-    flood_mask = (sky_like == 128).astype(np.uint8) * 255
+    flood_mask = (canvas == 128).astype(np.uint8) * 255
 
-    # Hard cap: never allow sky mask below 50% of image height
-    flood_mask[int(h * 0.5):, :] = 0
+    # Hard cap: sky never goes below 40% of image height
+    flood_mask[int(h * 0.40):, :] = 0
 
-    # Feather
-    flood_mask = cv2.GaussianBlur(flood_mask, (31, 31), 0)
+    # Feather edges
+    flood_mask = cv2.GaussianBlur(flood_mask, (21, 21), 0)
 
     covered = np.count_nonzero(flood_mask > 10)
     print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.02)})")
@@ -340,5 +337,7 @@ async def merge_hdr(req: MergeRequest):
 
 
 @app.get("/health")
+def health():
+    return {"status": "ok"}
 def health():
     return {"status": "ok"}
