@@ -60,19 +60,28 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
 def classify_sky_pixels(img: np.ndarray) -> np.ndarray:
     """
     Returns a binary mask (0 or 255) of pixels that LOOK like sky.
-    Uses HSV: blown-out white sky OR blue sky.
+    Blue sky OR overcast white sky, with stricter thresholds to exclude white walls.
     """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     h_ch = hsv[:, :, 0]   # 0-180
     s_ch = hsv[:, :, 1]   # 0-255
     v_ch = hsv[:, :, 2]   # 0-255
 
-    # Blown-out / overcast white sky: very bright + very low saturation
-    blown = (v_ch > 200) & (s_ch < 35)
-    # Clear blue sky: hue in blue range, moderate-high brightness
-    blue  = (h_ch > 95) & (h_ch < 135) & (s_ch > 30) & (v_ch > 80)
+    # White walls have texture and edges — use Laplacian to detect flat/smooth regions
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    lap_abs = np.abs(lap)
+    # Smooth regions (low edge response) are more likely to be sky
+    smooth = (lap_abs < 12).astype(np.float32)
 
-    mask = ((blown | blue).astype(np.uint8)) * 255
+    # Blown-out / overcast white sky: very bright + very low saturation + smooth texture
+    blown = (v_ch > 210) & (s_ch < 25) & (smooth > 0)
+    # Clear blue sky: hue in blue range, moderate-high brightness
+    blue  = (h_ch > 95) & (h_ch < 135) & (s_ch > 25) & (v_ch > 70)
+    # Slightly hazy blue-white sky
+    hazy  = (h_ch > 85) & (h_ch < 145) & (s_ch > 10) & (s_ch < 80) & (v_ch > 160) & (smooth > 0)
+
+    mask = ((blown | blue | hazy).astype(np.uint8)) * 255
     return mask
 
 
@@ -88,66 +97,82 @@ def build_sky_mask(img: np.ndarray) -> np.ndarray:
     h, w = img.shape[:2]
     sky_px = classify_sky_pixels(img)   # 0 or 255
 
-    # --- Find per-column skyline ---
-    # Scan from top: skyline = lowest row in each column that is still sky-like
-    # Stop as soon as we hit a non-sky pixel (with small tolerance)
+    # -----------------------------------------------------------------------
+    # KEY STEP (Photoshop-style): only keep sky pixels that are CONNECTED to
+    # the top edge of the image.  White walls/ceilings are surrounded by
+    # non-sky pixels and will NOT have a path to row 0, so they are excluded.
+    # -----------------------------------------------------------------------
+    # Flood-fill from every sky pixel on the top row downward
+    connected = np.zeros((h, w), dtype=np.uint8)
+
+    # Seed: all sky pixels in the top 5 rows
+    seed_rows = min(5, h)
+    for row in range(seed_rows):
+        for col in range(w):
+            if sky_px[row, col] > 0:
+                connected[row, col] = 255
+
+    # BFS / iterative downward propagation with 4-connectivity
+    # Use morphological dilation on the sky_px masked by connectivity
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for _ in range(h):   # max iterations = image height
+        expanded = cv2.dilate(connected, kernel, iterations=1)
+        new_connected = cv2.bitwise_and(expanded, sky_px)
+        if np.array_equal(new_connected, connected):
+            break
+        connected = new_connected
+
+    sky_px = connected   # only connected-to-top sky pixels
+
+    # -----------------------------------------------------------------------
+    # Per-column skyline: find the lowest sky row reachable from the top
+    # -----------------------------------------------------------------------
     skyline = np.zeros(w, dtype=np.float32)
-
     for col in range(w):
-        col_sky = sky_px[:, col]  # 0 or 255 per row
-        # Find contiguous sky run from the top
-        run_end = 0
-        for row in range(h):
-            if col_sky[row] > 0:
-                run_end = row
-            else:
-                # Allow a gap of up to 5 non-sky pixels (for tree branches, wires)
-                gap = 0
-                for rr in range(row, min(row + 6, h)):
-                    if col_sky[rr] > 0:
-                        gap = rr
-                        break
-                if gap > 0:
-                    run_end = gap
-                else:
-                    break
-        skyline[col] = run_end
+        col_mask = sky_px[:, col]
+        rows = np.where(col_mask > 0)[0]
+        if len(rows) > 0:
+            skyline[col] = float(rows[-1])   # lowest (deepest) connected sky row
+        else:
+            skyline[col] = 0.0
 
-    # Hard cap: skyline never below 45% of image height
-    max_sky_row = int(h * 0.45)
+    # Hard cap: skyline never below 55% of image height
+    max_sky_row = int(h * 0.55)
     skyline = np.minimum(skyline, max_sky_row)
 
-    # Smooth skyline horizontally (removes jagged column-by-column noise)
-    skyline = cv2.GaussianBlur(skyline.reshape(1, -1).astype(np.float32),
-                               (51, 1), 0).flatten()
+    # Smooth skyline horizontally to remove column-by-column jaggies
+    skyline_smooth = cv2.GaussianBlur(
+        skyline.reshape(1, -1).astype(np.float32), (61, 1), 0
+    ).flatten()
 
-    # --- Build alpha mask ---
-    feather = int(h * 0.03)   # ~3% of image height for soft edge
-    alpha = np.zeros((h, w), dtype=np.float32)
+    # -----------------------------------------------------------------------
+    # Build alpha: blend at the skyline boundary, hard 0 below
+    # -----------------------------------------------------------------------
+    feather = max(int(h * 0.025), 8)   # ~2.5% of height
+    row_idx = np.arange(h, dtype=np.float32)[:, np.newaxis]          # (h,1)
+    sl = skyline_smooth[np.newaxis, :]                                 # (1,w)
 
-    for col in range(w):
-        sl = int(skyline[col])
-        for row in range(h):
-            if row <= sl - feather:
-                # Fully sky — but only if this pixel looks like sky
-                if sky_px[row, col] > 0:
-                    alpha[row, col] = 1.0
-                else:
-                    alpha[row, col] = 0.0   # non-sky pixel above skyline (e.g. building peak)
-            elif row <= sl + feather:
-                # Feather transition zone
-                t = (sl - row) / (2 * feather) + 0.5   # 1.0 at top of zone, 0.0 at bottom
-                t = max(0.0, min(1.0, t))
-                if sky_px[row, col] > 0:
-                    alpha[row, col] = t
-                else:
-                    alpha[row, col] = t * 0.3   # very faint near non-sky edge pixels
-            else:
-                alpha[row, col] = 0.0
+    # Above skyline: alpha=1 where sky_px, else 0
+    # In feather zone: graduated alpha
+    # Below skyline: alpha=0
+    dist = sl - row_idx   # positive = above skyline
+    alpha = np.clip((dist + feather) / (2 * feather), 0.0, 1.0)       # (h,w)
 
-    # Light blur to soften pixel-level jaggies
-    alpha_u8 = np.clip(alpha * 255, 0, 255).astype(np.uint8)
-    alpha_u8 = cv2.GaussianBlur(alpha_u8, (11, 11), 0)
+    # Mask out non-sky pixels (walls/structures above the skyline line)
+    sky_float = (sky_px.astype(np.float32) / 255.0)
+    # Above skyline strictly: require sky pixel
+    above = (row_idx <= sl - feather).astype(np.float32)
+    feather_zone = ((row_idx > sl - feather) & (row_idx <= sl + feather)).astype(np.float32)
+
+    alpha_final = (
+        above * sky_float +
+        feather_zone * alpha * np.maximum(sky_float, 0.4)   # feather even if not pure sky pixel
+    )
+    # Below skyline: already 0
+
+    alpha_u8 = np.clip(alpha_final * 255, 0, 255).astype(np.uint8)
+    # Final smoothing pass for soft edges (like Photoshop "Refine Edge")
+    alpha_u8 = cv2.bilateralFilter(alpha_u8, 9, 30, 30)
 
     covered = np.count_nonzero(alpha_u8 > 10)
     print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.01)})")
@@ -387,7 +412,5 @@ async def merge_hdr(req: MergeRequest):
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
 def health():
     return {"status": "ok"}
