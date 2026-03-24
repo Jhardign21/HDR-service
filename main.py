@@ -59,95 +59,80 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
 
 def build_sky_mask(img: np.ndarray) -> np.ndarray:
     """
-    Sky detection using edge-density + color + top-connectivity.
-    Core insight (how Lightroom/PS work):
-      - Sky has near-ZERO local edge density
-      - Walls have siding/window/brick edges
-      - Snow has grain
-      - Only sky is edge-free AND touches the top of the frame
+    GrabCut-based sky segmentation.
+    Spatial priors: top strip = sky, bottom strip = foreground.
+    GrabCut resolves the ambiguous middle region using color GMMs.
     """
     h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # -----------------------------------------------------------------------
-    # STEP 1: Edge density map
-    # Canny finds structural edges; dilate + blur gives local edge density
-    # -----------------------------------------------------------------------
-    edges = cv2.Canny(gray, 25, 75)  # structural edges (siding, rooflines, windows)
-    # Dilate so thin edges spread, then blur to get density in local neighborhood
-    edges_d = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
-    edge_density = cv2.GaussianBlur(edges_d.astype(np.float32), (61, 61), 0)
-    # Normalize 0-1
-    ed_max = edge_density.max()
-    if ed_max > 0:
-        edge_density /= ed_max
+    # -----------------------------------------------------------------
+    # STEP 1: Use GrabCut with spatial seeds
+    # GR_BGD=0 definite bg (sky), GR_FGD=1 definite fg, PR_BGD=2, PR_FGD=3
+    # We treat SKY as "background" and HOUSE as "foreground" for GrabCut
+    # -----------------------------------------------------------------
+    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)  # default: probably sky
 
-    # Low-edge-density pixels are sky candidates
-    # Adaptive threshold: calibrate from the top 10% of the image (known sky)
-    top_ed = edge_density[:int(h * 0.10), :]
-    ed_thresh = float(np.percentile(top_ed, 90)) * 2.5  # 2.5x the top-strip reference
-    ed_thresh = max(ed_thresh, 0.08)  # minimum threshold
-    low_edge_px = (edge_density < ed_thresh).astype(np.uint8) * 255
+    sky_rows    = int(h * 0.18)   # top 18% = definitely sky
+    ground_rows = int(h * 0.45)   # bottom 45% = definitely not sky
 
-    # -----------------------------------------------------------------------
-    # STEP 2: Color confirmation
-    # Sky is blue OR bright+very-low-saturation (overcast/hazy/blown)
-    # Snow: bright but has texture/edges (filtered by step 1)
-    # Walls: may be bright but have edges (filtered by step 1)
-    # -----------------------------------------------------------------------
+    gc_mask[:sky_rows,    :] = cv2.GC_BGD   # definite sky ("background" in GrabCut terms)
+    gc_mask[h-ground_rows:, :] = cv2.GC_FGD  # definite foreground
+
+    # Also force-seed obvious blue pixels as sky anywhere in the image
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    h_ch, s_ch, v_ch = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+    blue_sky = (h_ch > 95) & (h_ch < 140) & (s_ch > 40) & (v_ch > 60)
+    gc_mask[blue_sky] = cv2.GC_BGD  # confirmed sky pixels
 
-    blue_sky    = (h_ch > 90)  & (h_ch < 145) & (s_ch > 25)  & (v_ch > 50)
-    overcast    = (v_ch > 170) & (s_ch < 45)   # blown-out/overcast sky
-    sky_color   = (blue_sky | overcast).astype(np.uint8) * 255
-
-    # Candidate = edge-free AND looks like sky color
-    sky_candidate = cv2.bitwise_and(low_edge_px, sky_color)
-
-    # -----------------------------------------------------------------------
-    # STEP 3: Flood-fill connectivity from top edge (Photoshop "Select Sky")
-    # Only pixels reachable from the top 2 rows through candidate pixels are sky.
-    # Disconnected bright/smooth regions (walls, snow) are excluded.
-    # -----------------------------------------------------------------------
-    connected = np.zeros((h, w), dtype=np.uint8)
-    connected[:2, :] = sky_candidate[:2, :]  # seed from top 2 rows
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    max_sky_row = int(h * 0.75)  # sky cannot extend below 75% of height
-    for _ in range(max_sky_row):
-        expanded = cv2.dilate(connected, kernel, iterations=1)
-        expanded[max_sky_row:, :] = 0
-        new_connected = cv2.bitwise_and(expanded, sky_candidate)
-        if np.array_equal(new_connected, connected):
-            break
-        connected = new_connected
-
-    sky_px = connected
-
-    # If nothing was found, abort
-    if np.count_nonzero(sky_px) < int(h * w * 0.005):
-        print("[sky] no sky found — skipping")
+    # Run GrabCut (iterative = 5 passes for accuracy)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(img, gc_mask, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+    except Exception as e:
+        print(f"[sky] GrabCut failed: {e}")
         return np.zeros((h, w), dtype=np.uint8)
 
-    # -----------------------------------------------------------------------
+    # Sky = GC_BGD or GC_PR_BGD
+    sky_binary = np.where((gc_mask == cv2.GC_BGD) | (gc_mask == cv2.GC_PR_BGD), 255, 0).astype(np.uint8)
+
+    # -----------------------------------------------------------------
+    # STEP 2: Force-zero below horizon — sky cannot be in lower 40%
+    # -----------------------------------------------------------------
+    sky_binary[int(h * 0.60):, :] = 0
+
+    # -----------------------------------------------------------------
+    # STEP 3: Keep only the component connected to the top edge
+    # -----------------------------------------------------------------
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_binary, connectivity=8)
+    top_row_labels = set(np.unique(labels[:5, :]).tolist()) - {0}  # labels touching top 5 rows
+    connected_sky = np.zeros((h, w), dtype=np.uint8)
+    for lbl in top_row_labels:
+        connected_sky[labels == lbl] = 255
+    sky_binary = connected_sky
+
+    if np.count_nonzero(sky_binary) < int(h * w * 0.005):
+        print("[sky] no sky found after GrabCut")
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # -----------------------------------------------------------------
     # STEP 4: Per-column skyline trace + smooth
-    # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------
     skyline = np.zeros(w, dtype=np.float32)
     for col in range(w):
-        rows = np.where(sky_px[:, col] > 0)[0]
+        rows = np.where(sky_binary[:, col] > 0)[0]
         skyline[col] = float(rows[-1]) if len(rows) > 0 else 0.0
 
-    skyline = np.minimum(skyline, int(h * 0.70))
+    skyline = np.minimum(skyline, int(h * 0.65))
     skyline_smooth = cv2.GaussianBlur(
         skyline.reshape(1, -1).astype(np.float32), (61, 1), 0
     ).flatten()
 
-    # -----------------------------------------------------------------------
-    # STEP 5: Build soft alpha with feathered skyline boundary
-    # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------
+    # STEP 5: Soft feathered alpha at skyline
+    # -----------------------------------------------------------------
     feather = max(int(h * 0.025), 8)
-    sky_float = sky_px.astype(np.float32) / 255.0
+    sky_f = sky_binary.astype(np.float32) / 255.0
     row_idx = np.arange(h, dtype=np.float32)[:, np.newaxis]
     sl = skyline_smooth[np.newaxis, :]
 
@@ -155,29 +140,61 @@ def build_sky_mask(img: np.ndarray) -> np.ndarray:
     t         = np.clip((sl - row_idx + feather) / (2 * feather), 0.0, 1.0)
     in_feather = ((row_idx > sl - feather) & (row_idx <= sl + feather)).astype(np.float32)
 
-    alpha_final = above * sky_float + in_feather * t * sky_float
+    alpha_final = above * sky_f + in_feather * t * sky_f
     alpha_u8 = np.clip(alpha_final * 255, 0, 255).astype(np.uint8)
     alpha_u8 = cv2.GaussianBlur(alpha_u8, (15, 15), 0)
 
     covered = np.count_nonzero(alpha_u8 > 10)
-    print(f"[sky] ed_thresh={ed_thresh:.3f}  sky_px={covered}  ({100*covered//(h*w)}%)")
+    print(f"[sky] GrabCut sky_px={covered} ({100*covered//(h*w)}%)")
     return alpha_u8
+
+
+def color_match_sky(sky: np.ndarray, img: np.ndarray, fg_mask: np.ndarray) -> np.ndarray:
+    """
+    Adjust sky brightness/color to match the foreground scene lighting.
+    Uses simple per-channel mean matching in LAB space.
+    """
+    fg = img[fg_mask > 128].reshape(-1, 3).astype(np.float32)
+    if len(fg) < 100:
+        return sky
+
+    # Convert both to LAB
+    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sky_lab = cv2.cvtColor(sky, cv2.COLOR_BGR2LAB).astype(np.float32)
+    fg_lab  = img_lab[fg_mask > 128]
+
+    for ch in range(3):
+        fg_mean = float(np.mean(fg_lab[:, ch]))
+        fg_std  = float(np.std(fg_lab[:, ch])) + 1e-6
+        sk_mean = float(np.mean(sky_lab[:, :, ch]))
+        sk_std  = float(np.std(sky_lab[:, :, ch])) + 1e-6
+        # Scale sky channel to match foreground statistics (Reinhard color transfer)
+        sky_lab[:, :, ch] = (sky_lab[:, :, ch] - sk_mean) * (fg_std / sk_std) + fg_mean
+
+    sky_lab = np.clip(sky_lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(sky_lab, cv2.COLOR_LAB2BGR)
 
 
 def apply_sky_replacement(img: np.ndarray) -> tuple:
     h, w = img.shape[:2]
-    mask = build_sky_mask(img)
-    covered = np.count_nonzero(mask > 10)
+    sky_mask = build_sky_mask(img)
+    covered = np.count_nonzero(sky_mask > 10)
     min_px = int(h * w * 0.01)   # at least 1% of image
 
     if covered < min_px:
         print("Sky region too small — skipping replacement")
         return img, False
 
-    sky = make_sky_gradient(h, w).astype(np.float32)
-    src = img.astype(np.float32)
-    a   = mask.astype(np.float32)[:, :, np.newaxis] / 255.0
-    result = sky * a + src * (1.0 - a)
+    # Build replacement sky gradient
+    sky = make_sky_gradient(h, w)
+
+    # Color-match sky to foreground lighting (Reinhard LAB transfer)
+    fg_mask = cv2.bitwise_not(sky_mask)
+    sky = color_match_sky(sky, img, fg_mask)
+
+    # Composite
+    a      = sky_mask.astype(np.float32)[:, :, np.newaxis] / 255.0
+    result = sky.astype(np.float32) * a + img.astype(np.float32) * (1.0 - a)
     print(f"Sky replaced — {covered} pixels blended")
     return np.clip(result, 0, 255).astype(np.uint8), True
 
