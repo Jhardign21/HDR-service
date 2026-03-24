@@ -59,13 +59,8 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
 
 def build_sky_mask(img: np.ndarray) -> np.ndarray:
     """
-    Detect sky (exterior shots) by flood-filling from the top edge.
-    Works for both blown-out white sky AND grey/overcast/blue sky.
-    Strategy:
-      1. Find sky-like pixels: bright, low-saturation OR pale blue — top portion of image.
-      2. Seed flood fill from top row.
-      3. Keep only connected region touching the top.
-      4. Feather for blending.
+    Detect sky only at the very top of the image.
+    Strict thresholds to avoid replacing interior walls/ceilings.
     """
     h, w = img.shape[:2]
 
@@ -78,41 +73,34 @@ def build_sky_mask(img: np.ndarray) -> np.ndarray:
     min_c = np.minimum(np.minimum(b, g), r)
     chroma = max_c - min_c
 
-    # Sky-like: bright enough AND near-neutral (grey/white/pale blue)
-    # Also catch blue-sky pixels (blue channel dominant)
-    blue_dominant = (b > r + 10) & (b > g - 20)
-    near_neutral  = chroma < 80
-    bright_enough = brightness > 120
+    # Much stricter: very bright AND very neutral (white/grey blown sky)
+    # OR clearly blue-dominant (actual blue sky)
+    blue_sky = (b > r + 20) & (b > g + 5) & (brightness > 140)
+    blown_sky = (brightness > 200) & (chroma < 30)
 
-    sky_like = ((bright_enough & near_neutral) | (bright_enough & blue_dominant)).astype(np.uint8) * 255
+    sky_like = (blue_sky | blown_sky).astype(np.uint8) * 255
 
-    # Morphological close to bridge small gaps (wires, branches)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    # Only consider top 35% of image for sky seeds
+    sky_like[int(h * 0.35):, :] = 0
+
+    # Morphological close to bridge small gaps
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     sky_like = cv2.morphologyEx(sky_like, cv2.MORPH_CLOSE, k)
 
-    # Flood fill from every point on the top edge that is sky-like
+    # Flood fill only from top edge pixels that are sky-like
     filled = np.zeros((h + 2, w + 2), np.uint8)
-    seed_mask = np.zeros_like(filled)
     for x in range(w):
         if sky_like[0, x] == 255:
             cv2.floodFill(sky_like, filled, (x, 0), 128)
 
-    # Extract the flooded region
+    # Extract flooded region
     flood_mask = (sky_like == 128).astype(np.uint8) * 255
 
-    # Also include any remaining bright neutral blobs connected from top 30%
-    top_region = np.zeros_like(sky_like)
-    top_region[:h // 3, :] = sky_like[:h // 3, :]
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(top_region, connectivity=8)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] > w * h * 0.001:
-            flood_mask[labels == i] = 255
-
-    # Dilate slightly to cover horizon fringe
-    flood_mask = cv2.dilate(flood_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    # Hard cap: never allow sky mask below 50% of image height
+    flood_mask[int(h * 0.5):, :] = 0
 
     # Feather
-    flood_mask = cv2.GaussianBlur(flood_mask, (41, 41), 0)
+    flood_mask = cv2.GaussianBlur(flood_mask, (31, 31), 0)
 
     covered = np.count_nonzero(flood_mask > 10)
     print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.02)})")
