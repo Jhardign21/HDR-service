@@ -51,54 +51,107 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
     for row in range(h):
         t = row / max(h - 1, 1)
         # BGR
-        sky[row, :, 0] = 210 + 30 * t   # B: 210→240
-        sky[row, :, 1] = 130 + 60 * t   # G: 130→190
-        sky[row, :, 2] = 40  + 50 * t   # R: 40→90
+        sky[row, :, 0] = 210 + 30 * t   # B: 210->240
+        sky[row, :, 1] = 130 + 60 * t   # G: 130->190
+        sky[row, :, 2] = 40  + 50 * t   # R: 40->90
     return np.clip(sky, 0, 255).astype(np.uint8)
+
+
+def classify_sky_pixels(img: np.ndarray) -> np.ndarray:
+    """
+    Returns a binary mask (0 or 255) of pixels that LOOK like sky.
+    Uses HSV: blown-out white sky OR blue sky.
+    """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h_ch = hsv[:, :, 0]   # 0-180
+    s_ch = hsv[:, :, 1]   # 0-255
+    v_ch = hsv[:, :, 2]   # 0-255
+
+    # Blown-out / overcast white sky: very bright + very low saturation
+    blown = (v_ch > 200) & (s_ch < 35)
+    # Clear blue sky: hue in blue range, moderate-high brightness
+    blue  = (h_ch > 95) & (h_ch < 135) & (s_ch > 30) & (v_ch > 80)
+
+    mask = ((blown | blue).astype(np.uint8)) * 255
+    return mask
 
 
 def build_sky_mask(img: np.ndarray) -> np.ndarray:
     """
-    NO flood fill — direct pixel classification only in the top region.
-    A smooth vertical gradient fades the replacement out naturally.
+    Photoshop-style sky mask:
+    1. Classify each pixel as sky-like or not (HSV)
+    2. For each column scan downward from top to find the skyline row
+    3. Smooth the skyline across columns (1D Gaussian)
+    4. Build a per-pixel alpha: 1 above skyline (if sky-like), 0 below,
+       with a soft feather band at the boundary
     """
     h, w = img.shape[:2]
+    sky_px = classify_sky_pixels(img)   # 0 or 255
 
-    b = img[:, :, 0].astype(np.float32)
-    g = img[:, :, 1].astype(np.float32)
-    r = img[:, :, 2].astype(np.float32)
+    # --- Find per-column skyline ---
+    # Scan from top: skyline = lowest row in each column that is still sky-like
+    # Stop as soon as we hit a non-sky pixel (with small tolerance)
+    skyline = np.zeros(w, dtype=np.float32)
 
-    brightness = (b + g + r) / 3.0
-    max_c = np.maximum(np.maximum(b, g), r)
-    min_c = np.minimum(np.minimum(b, g), r)
-    chroma = max_c - min_c
+    for col in range(w):
+        col_sky = sky_px[:, col]  # 0 or 255 per row
+        # Find contiguous sky run from the top
+        run_end = 0
+        for row in range(h):
+            if col_sky[row] > 0:
+                run_end = row
+            else:
+                # Allow a gap of up to 5 non-sky pixels (for tree branches, wires)
+                gap = 0
+                for rr in range(row, min(row + 6, h)):
+                    if col_sky[rr] > 0:
+                        gap = rr
+                        break
+                if gap > 0:
+                    run_end = gap
+                else:
+                    break
+        skyline[col] = run_end
 
-    # Pixel must be clearly blue OR clearly blown-out white (very bright + neutral)
-    blue_sky  = (b > r + 20) & (b > g + 10) & (brightness > 120)
-    blown_sky = (brightness > 220) & (chroma < 15)
-    sky_pixel = (blue_sky | blown_sky).astype(np.float32)
+    # Hard cap: skyline never below 45% of image height
+    max_sky_row = int(h * 0.45)
+    skyline = np.minimum(skyline, max_sky_row)
 
-    # Only consider the top 30% of the image at all
-    top_limit = int(h * 0.30)
-    sky_pixel[top_limit:, :] = 0
+    # Smooth skyline horizontally (removes jagged column-by-column noise)
+    skyline = cv2.GaussianBlur(skyline.reshape(1, -1).astype(np.float32),
+                               (51, 1), 0).flatten()
 
-    # Create a vertical weight that fades from 1.0 at top to 0.0 at top_limit
-    # This makes the blend taper naturally toward the roofline
-    fade = np.ones((h, 1), dtype=np.float32)
-    for row in range(top_limit, h):
-        fade[row, 0] = 0.0
-    for row in range(top_limit):
-        fade[row, 0] = 1.0 - (row / top_limit) * 0.3   # gentle top-to-bottom fade
+    # --- Build alpha mask ---
+    feather = int(h * 0.03)   # ~3% of image height for soft edge
+    alpha = np.zeros((h, w), dtype=np.float32)
 
-    mask = sky_pixel * fade
+    for col in range(w):
+        sl = int(skyline[col])
+        for row in range(h):
+            if row <= sl - feather:
+                # Fully sky — but only if this pixel looks like sky
+                if sky_px[row, col] > 0:
+                    alpha[row, col] = 1.0
+                else:
+                    alpha[row, col] = 0.0   # non-sky pixel above skyline (e.g. building peak)
+            elif row <= sl + feather:
+                # Feather transition zone
+                t = (sl - row) / (2 * feather) + 0.5   # 1.0 at top of zone, 0.0 at bottom
+                t = max(0.0, min(1.0, t))
+                if sky_px[row, col] > 0:
+                    alpha[row, col] = t
+                else:
+                    alpha[row, col] = t * 0.3   # very faint near non-sky edge pixels
+            else:
+                alpha[row, col] = 0.0
 
-    # Blur to soften edges
-    mask_u8 = np.clip(mask * 255, 0, 255).astype(np.uint8)
-    mask_u8 = cv2.GaussianBlur(mask_u8, (25, 25), 0)
+    # Light blur to soften pixel-level jaggies
+    alpha_u8 = np.clip(alpha * 255, 0, 255).astype(np.uint8)
+    alpha_u8 = cv2.GaussianBlur(alpha_u8, (11, 11), 0)
 
-    covered = np.count_nonzero(mask_u8 > 10)
+    covered = np.count_nonzero(alpha_u8 > 10)
     print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.01)})")
-    return mask_u8
+    return alpha_u8
 
 
 def apply_sky_replacement(img: np.ndarray) -> tuple:
