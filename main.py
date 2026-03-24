@@ -59,8 +59,8 @@ def make_sky_gradient(h: int, w: int) -> np.ndarray:
 
 def build_sky_mask(img: np.ndarray) -> np.ndarray:
     """
-    Detect sky by seeding only from the very top rows of the image.
-    Prevents white walls/snow from being mistaken for sky.
+    NO flood fill — direct pixel classification only in the top region.
+    A smooth vertical gradient fades the replacement out naturally.
     """
     h, w = img.shape[:2]
 
@@ -73,42 +73,39 @@ def build_sky_mask(img: np.ndarray) -> np.ndarray:
     min_c = np.minimum(np.minimum(b, g), r)
     chroma = max_c - min_c
 
-    blue_sky  = (b > r + 15) & (b > g + 5) & (brightness > 100)
-    blown_sky = (brightness > 210) & (chroma < 20)
-    sky_like  = (blue_sky | blown_sky).astype(np.uint8) * 255
+    # Pixel must be clearly blue OR clearly blown-out white (very bright + neutral)
+    blue_sky  = (b > r + 20) & (b > g + 10) & (brightness > 120)
+    blown_sky = (brightness > 220) & (chroma < 15)
+    sky_pixel = (blue_sky | blown_sky).astype(np.float32)
 
-    # Build seed mask: ONLY use the very top 5% of the image as flood-fill seeds
-    # This prevents white house walls from becoming seeds
-    seed_zone = int(h * 0.05)
-    seed_mask = sky_like.copy()
-    seed_mask[seed_zone:, :] = 0   # clear everything below top 5%
+    # Only consider the top 30% of the image at all
+    top_limit = int(h * 0.30)
+    sky_pixel[top_limit:, :] = 0
 
-    # Flood fill from every top-edge pixel that qualifies as sky
-    canvas = sky_like.copy()
-    filled = np.zeros((h + 2, w + 2), np.uint8)
-    for x in range(w):
-        if seed_mask[0, x] > 0:
-            cv2.floodFill(canvas, filled, (x, 0), 128,
-                          loDiff=(15, 15, 15), upDiff=(15, 15, 15))
+    # Create a vertical weight that fades from 1.0 at top to 0.0 at top_limit
+    # This makes the blend taper naturally toward the roofline
+    fade = np.ones((h, 1), dtype=np.float32)
+    for row in range(top_limit, h):
+        fade[row, 0] = 0.0
+    for row in range(top_limit):
+        fade[row, 0] = 1.0 - (row / top_limit) * 0.3   # gentle top-to-bottom fade
 
-    flood_mask = (canvas == 128).astype(np.uint8) * 255
+    mask = sky_pixel * fade
 
-    # Hard cap: sky never goes below 40% of image height
-    flood_mask[int(h * 0.40):, :] = 0
+    # Blur to soften edges
+    mask_u8 = np.clip(mask * 255, 0, 255).astype(np.uint8)
+    mask_u8 = cv2.GaussianBlur(mask_u8, (25, 25), 0)
 
-    # Feather edges
-    flood_mask = cv2.GaussianBlur(flood_mask, (21, 21), 0)
-
-    covered = np.count_nonzero(flood_mask > 10)
-    print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.02)})")
-    return flood_mask
+    covered = np.count_nonzero(mask_u8 > 10)
+    print(f"Sky mask pixels: {covered}  (threshold: {int(h * w * 0.01)})")
+    return mask_u8
 
 
 def apply_sky_replacement(img: np.ndarray) -> tuple:
     h, w = img.shape[:2]
     mask = build_sky_mask(img)
     covered = np.count_nonzero(mask > 10)
-    min_px = int(h * w * 0.02)   # at least 2% of image
+    min_px = int(h * w * 0.01)   # at least 1% of image
 
     if covered < min_px:
         print("Sky region too small — skipping replacement")
