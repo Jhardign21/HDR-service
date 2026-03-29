@@ -38,120 +38,6 @@ class ProcessingParams(BaseModel):
     whites: float = 0.93         # 0.7 to 1
     blacks: float = 0.04         # 0 to 0.2
     temperature: float = 0.0     # -50 to +50
-    sky_pull: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Sky replacement — exterior-aware approach
-# ---------------------------------------------------------------------------
-
-def make_sky_gradient(h: int, w: int) -> np.ndarray:
-    """Vivid real-estate blue sky: deep azure at top, lighter sky-blue at bottom."""
-    sky = np.zeros((h, w, 3), dtype=np.float32)
-    for row in range(h):
-        t = row / max(h - 1, 1)
-        # BGR
-        sky[row, :, 0] = 210 + 30 * t   # B: 210->240
-        sky[row, :, 1] = 130 + 60 * t   # G: 130->190
-        sky[row, :, 2] = 40  + 50 * t   # R: 40->90
-    return np.clip(sky, 0, 255).astype(np.uint8)
-
-
-def build_sky_mask(img: np.ndarray) -> np.ndarray:
-    """
-    Column-by-column structural skyline detection.
-    Scans from the top of each column and finds where edges accumulate
-    (roofline, treetops, fences). Everything above = sky.
-    Works regardless of sky/snow color similarity.
-    """
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Structural edges (rooflines, window frames, siding, fences)
-    edges = cv2.Canny(gray, 30, 90)
-
-    # Per-column skyline: scan from top, sky ends where 3+ edge pixels accumulate
-    skyline = np.zeros(w, dtype=np.float32)
-    for col in range(w):
-        col_edges = edges[:, col]
-        cumulative = np.cumsum(col_edges > 0)
-        structure_rows = np.where(cumulative >= 3)[0]
-        if len(structure_rows) > 0:
-            skyline[col] = float(structure_rows[0])
-        else:
-            skyline[col] = h * 0.45  # conservative fallback
-
-    # Never let sky extend below 65% of image height
-    skyline = np.minimum(skyline, h * 0.65)
-
-    # Smooth the skyline to avoid jagged transitions
-    skyline_smooth = cv2.GaussianBlur(
-        skyline.reshape(1, -1).astype(np.float32), (101, 1), 0
-    ).flatten()
-
-    # Build soft alpha mask with feathered edge at skyline
-    feather = max(int(h * 0.02), 6)
-    row_idx = np.arange(h, dtype=np.float32)[:, np.newaxis]
-    sl = skyline_smooth[np.newaxis, :]
-
-    above     = (row_idx <= sl - feather).astype(np.float32)
-    t         = np.clip((sl - row_idx + feather) / (2 * feather), 0.0, 1.0)
-    in_feather = ((row_idx > sl - feather) & (row_idx <= sl + feather)).astype(np.float32)
-
-    alpha_final = above + in_feather * t
-    alpha_u8 = np.clip(alpha_final * 255, 0, 255).astype(np.uint8)
-    alpha_u8 = cv2.GaussianBlur(alpha_u8, (15, 15), 0)
-
-    covered = np.count_nonzero(alpha_u8 > 10)
-    print(f"[sky] skyline detection: sky_px={covered} ({100*covered//(h*w)}%)")
-    return alpha_u8
-
-
-def color_match_sky(sky: np.ndarray, img: np.ndarray, fg_mask: np.ndarray) -> np.ndarray:
-    """
-    Match sky brightness to the foreground scene (L channel only).
-    Deliberately avoids hue matching — that's what causes purple/pink shifts.
-    """
-    if np.count_nonzero(fg_mask > 128) < 100:
-        return sky
-
-    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    sky_lab = cv2.cvtColor(sky, cv2.COLOR_BGR2LAB).astype(np.float32)
-    fg_lab  = img_lab[fg_mask > 128]
-
-    # Transfer L (brightness) only — preserves the blue hue of replacement sky
-    fg_L_mean = float(np.mean(fg_lab[:, 0]))
-    fg_L_std  = float(np.std(fg_lab[:, 0])) + 1e-6
-    sk_L_mean = float(np.mean(sky_lab[:, :, 0]))
-    sk_L_std  = float(np.std(sky_lab[:, :, 0])) + 1e-6
-    sky_lab[:, :, 0] = (sky_lab[:, :, 0] - sk_L_mean) * (fg_L_std / sk_L_std) + fg_L_mean
-
-    sky_lab = np.clip(sky_lab, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(sky_lab, cv2.COLOR_LAB2BGR)
-
-
-def apply_sky_replacement(img: np.ndarray) -> tuple:
-    h, w = img.shape[:2]
-    sky_mask = build_sky_mask(img)
-    covered = np.count_nonzero(sky_mask > 10)
-    min_px = int(h * w * 0.01)   # at least 1% of image
-
-    if covered < min_px:
-        print("Sky region too small — skipping replacement")
-        return img, False
-
-    # Build replacement sky gradient
-    sky = make_sky_gradient(h, w)
-
-    # Color-match sky to foreground lighting (Reinhard LAB transfer)
-    fg_mask = cv2.bitwise_not(sky_mask)
-    sky = color_match_sky(sky, img, fg_mask)
-
-    # Composite
-    a      = sky_mask.astype(np.float32)[:, :, np.newaxis] / 255.0
-    result = sky.astype(np.float32) * a + img.astype(np.float32) * (1.0 - a)
-    print(f"Sky replaced — {covered} pixels blended")
-    return np.clip(result, 0, 255).astype(np.uint8), True
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +59,6 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = np.clip(f, 0, p.whites) / p.whites
 
     # 4. S-curve contrast (lifts mids, deepens shadows slightly)
-    # Apply a subtle S-curve: shadows slightly deeper, mids brighter
     f = f * f * (3.0 - 2.0 * f)   # smoothstep — adds contrast naturally
 
     # 5. Shadow lift on dark areas
@@ -215,7 +100,6 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
 class MergeRequest(BaseModel):
     file_urls: List[str]
     bracket_name: str = "bracket"
-    replace_sky: bool = True
     params: Optional[ProcessingParams] = None
 
 
@@ -327,12 +211,6 @@ async def merge_hdr(req: MergeRequest):
         del merged
         gc.collect()
 
-        # Sky replacement
-        sky_replaced = False
-        if req.replace_sky and p.sky_pull:
-            toned, sky_replaced = apply_sky_replacement(toned)
-            gc.collect()
-
         # Encode
         pil = Image.fromarray(cv2.cvtColor(toned, cv2.COLOR_BGR2RGB))
         del toned
@@ -351,8 +229,6 @@ async def merge_hdr(req: MergeRequest):
             "width": OUTPUT_WIDTH,
             "height": OUTPUT_HEIGHT,
             "jpeg_base64": jpg_b64,
-            "sky_replaced": sky_replaced,
-            "window_pull_applied": True,
         }
 
     except Exception as e:
