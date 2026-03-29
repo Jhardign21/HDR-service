@@ -383,3 +383,4 @@ async def merge_hdr(req: MergeRequest):
 
 @app.get("/health")
 def health():
+    return {"status": "ok"}
