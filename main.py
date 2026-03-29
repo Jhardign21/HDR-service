@@ -38,10 +38,58 @@ class ProcessingParams(BaseModel):
     whites: float = 0.93         # 0.7 to 1
     blacks: float = 0.04         # 0 to 0.2
     temperature: float = 0.0     # -50 to +50
+    window_pull: float = 0.7     # 0 to 1  (strength of window darkening)
 
 
 # ---------------------------------------------------------------------------
-# Tone pipeline — tuned to produce punchy real-estate look
+# Window detection & pull
+# ---------------------------------------------------------------------------
+
+def detect_window_mask(img: np.ndarray, threshold: int = 210) -> np.ndarray:
+    """
+    Returns a float32 mask [0..1] where bright window regions are 1.0.
+    Uses luminance in LAB space to find blown-out / very bright areas.
+    """
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]  # 0-255
+
+    # Threshold on luminance
+    _, bright_mask = cv2.threshold(L, threshold, 255, cv2.THRESH_BINARY)
+
+    # Morphological cleanup: close small gaps, remove tiny specks
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel)
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    # Find connected components — keep only reasonably large blobs (windows are big)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bright_mask, connectivity=8)
+    min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.001  # at least 0.1% of frame
+    filtered = np.zeros_like(bright_mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            filtered[labels == i] = 255
+
+    # Feather the edges for smooth blending
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=25)
+    feathered = feathered / 255.0
+    return feathered
+
+
+def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
+                      mask: np.ndarray, strength: float = 0.7) -> np.ndarray:
+    """
+    Blend darkest exposure into window regions using the mask.
+    strength=0 → no pull, strength=1 → full dark image in windows.
+    """
+    merged_f = merged.astype(np.float32)
+    dark_f = dark_img.astype(np.float32)
+    mask3 = np.stack([mask * strength] * 3, axis=2)
+    result = merged_f * (1.0 - mask3) + dark_f * mask3
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Tone pipeline
 # ---------------------------------------------------------------------------
 
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
@@ -49,7 +97,7 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
 
     # 1. Gamma lift + exposure boost
     ev = 2.0 ** p.exposure
-    f  = np.power(np.clip(f, 1e-6, 1.0), 0.72)   # gentle gamma lift
+    f  = np.power(np.clip(f, 1e-6, 1.0), 0.72)
     f  = np.clip(f * ev, 0, 1)
 
     # 2. Black floor
@@ -58,10 +106,10 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 3. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
 
-    # 4. S-curve contrast (lifts mids, deepens shadows slightly)
-    f = f * f * (3.0 - 2.0 * f)   # smoothstep — adds contrast naturally
+    # 4. S-curve contrast
+    f = f * f * (3.0 - 2.0 * f)
 
-    # 5. Shadow lift on dark areas
+    # 5. Shadow lift
     shadow_mask = np.clip(1.0 - f / 0.4, 0, 1)
     f = f + shadow_mask * p.shadows
     f = np.clip(f, 0, 1)
@@ -69,22 +117,22 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 6. Temperature shift
     if abs(p.temperature) > 0.5:
         shift = p.temperature / 400.0
-        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)  # R warmer
-        f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.5, 0, 1)  # B slightly cooler
+        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)
+        f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.5, 0, 1)
 
-    # 7. Neutral white balance (per-channel highlight normalisation)
+    # 7. Neutral white balance
     for c in range(3):
         p99 = float(np.percentile(f[:, :, c], 99))
         if p99 > 0.55:
             f[:, :, c] = np.clip(f[:, :, c] * (0.97 / p99), 0, 1)
 
-    # 8. Saturation (HSV)
+    # 8. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * p.saturation, 0, 255)
     result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # 9. Mild sharpening (unsharp mask)
+    # 9. Mild sharpening
     blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=1.5)
     result = cv2.addWeighted(result, 1.4, blurred, -0.4, 0)
 
@@ -174,6 +222,11 @@ def merge_mertens(images: List[np.ndarray]) -> np.ndarray:
     return result
 
 
+def get_darkest_image(images: List[np.ndarray]) -> np.ndarray:
+    """Return the image with the lowest mean brightness (darkest = best window detail)."""
+    return min(images, key=lambda img: float(np.mean(img)))
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -201,10 +254,26 @@ async def merge_hdr(req: MergeRequest):
         if len(images) > 1:
             images = align_images(images)
 
+        # Keep a reference to the darkest image for window pull before merging
+        dark_img = get_darkest_image(images)
+
         merged = images[0] if len(images) == 1 else merge_mertens(images)
         if len(images) > 1:
             del images
             gc.collect()
+
+        # Window pull: detect blown-out window regions and blend in dark exposure
+        if p.window_pull > 0:
+            print("Detecting windows...")
+            window_mask = detect_window_mask(merged, threshold=210)
+            window_coverage = float(np.mean(window_mask))
+            print(f"Window mask coverage: {window_coverage:.3f}")
+            if window_coverage > 0.001:
+                print(f"Applying window pull (strength={p.window_pull})...")
+                merged = apply_window_pull(merged, dark_img, window_mask, strength=p.window_pull)
+
+        del dark_img
+        gc.collect()
 
         # Tone mapping
         toned = apply_tone(merged, p)
