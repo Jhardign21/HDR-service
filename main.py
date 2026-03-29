@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.15       # reduced — prevents floor blowout
-    saturation: float = 1.1       # 0 to 2
-    shadows: float = 0.08         # 0 to 0.5
-    whites: float = 0.92          # pull whites down to retain floor texture
-    blacks: float = 0.01          # 0 to 0.2
-    temperature: float = -10.0    # negative = cooler/more neutral
-    window_pull: float = 0.92     # stronger window pull
+    exposure: float = -0.35       # darker overall to preserve floor texture
+    saturation: float = 1.1
+    shadows: float = 0.08
+    whites: float = 0.88          # lower whites ceiling = more floor detail
+    blacks: float = 0.01
+    temperature: float = -10.0
+    window_pull: float = 0.92
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +101,9 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
     """
     merged_f = merged.astype(np.float32)
     dark_f = dark_img.astype(np.float32)
-    # Brighten dark image so exterior detail is clearly visible
-    dark_brightened = np.clip(dark_f * 1.8, 0, 255)
+    # Use dark image as-is — no brightening, we WANT the underexposed exterior detail
     mask3 = np.stack([mask * strength] * 3, axis=2)
-    result = merged_f * (1.0 - mask3) + dark_brightened * mask3
+    result = merged_f * (1.0 - mask3) + dark_f * mask3
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
@@ -133,6 +132,12 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
 
     # 5. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
+
+    # 5b. Highlight rolloff — compress very bright areas (prevents floor blowout)
+    # Smoothly compress anything above 0.80 so highlights retain texture
+    hi_mask = np.clip((f - 0.80) / 0.20, 0, 1)
+    f = f - hi_mask * (f - 0.80) * 0.45
+    f = np.clip(f, 0, 1)
 
     # 6. Mild S-curve for contrast
     f = f * f * (3.0 - 2.0 * f)
@@ -293,24 +298,34 @@ async def merge_hdr(req: MergeRequest):
             del images
             gc.collect()
 
-        # Window pull: detect blown windows, blend in darkest bracket
+        # Detect window mask on merged (before tone) — merged shows blown windows clearly
+        window_mask = None
         if p.window_pull > 0:
             print("Detecting windows...")
-            window_mask = detect_window_mask(merged, threshold=195)
+            window_mask = detect_window_mask(merged, threshold=190)
             window_coverage = float(np.mean(window_mask))
             print(f"Window mask coverage: {window_coverage:.4f}")
-            if window_coverage > 0.0005:
-                print(f"Applying window pull (strength={p.window_pull})...")
-                merged = apply_window_pull(merged, dark_img, window_mask, strength=p.window_pull)
-            else:
-                print("No significant window regions detected, skipping pull")
+            if window_coverage <= 0.0005:
+                print("No significant window regions detected")
+                window_mask = None
 
-        del dark_img
-        gc.collect()
-
-        # Tone mapping
+        # Tone mapping first
         toned = apply_tone(merged, p)
         del merged
+        gc.collect()
+
+        # Apply window pull AFTER tone mapping so exterior detail is NOT brightened by tone pipeline
+        if window_mask is not None and p.window_pull > 0:
+            # Tone-map the dark image too so color is consistent, but preserve its darkness
+            dark_toned = apply_tone(dark_img, p)
+            # Then pull it back down to preserve dark exterior — scale by 0.65 to keep it dark
+            dark_for_windows = np.clip(dark_toned.astype(np.float32) * 0.65, 0, 255).astype(np.uint8)
+            del dark_toned
+            print(f"Applying window pull after tone (strength={p.window_pull})...")
+            toned = apply_window_pull(toned, dark_for_windows, window_mask, strength=p.window_pull)
+            del dark_for_windows
+
+        del dark_img
         gc.collect()
 
         # Encode
@@ -340,12 +355,3 @@ async def merge_hdr(req: MergeRequest):
     finally:
         for path in tmp_paths:
             try:
-                os.unlink(path)
-            except Exception:
-                pass
-        gc.collect()
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
