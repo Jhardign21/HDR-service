@@ -32,20 +32,20 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = 0.3         # -2 to +2  EV
+    exposure: float = -0.15       # reduced — prevents floor blowout
     saturation: float = 1.1       # 0 to 2
-    shadows: float = 0.12         # 0 to 0.5
-    whites: float = 0.97          # 0.7 to 1
-    blacks: float = 0.02          # 0 to 0.2
-    temperature: float = -8.0     # negative = cooler/more neutral
-    window_pull: float = 0.85     # 0 to 1 — strength of window darkening
+    shadows: float = 0.08         # 0 to 0.5
+    whites: float = 0.92          # pull whites down to retain floor texture
+    blacks: float = 0.01          # 0 to 0.2
+    temperature: float = -10.0    # negative = cooler/more neutral
+    window_pull: float = 0.92     # stronger window pull
 
 
 # ---------------------------------------------------------------------------
 # Window detection & pull
 # ---------------------------------------------------------------------------
 
-def detect_window_mask(img: np.ndarray, threshold: int = 195) -> np.ndarray:
+def detect_window_mask(img: np.ndarray, threshold: int = 185) -> np.ndarray:
     """
     Detects blown-out / very bright regions (windows) via LAB luminance.
     Returns a float32 feathered mask [0..1].
@@ -56,30 +56,30 @@ def detect_window_mask(img: np.ndarray, threshold: int = 195) -> np.ndarray:
     # Primary: very bright pixels
     _, bright = cv2.threshold(L, threshold, 255, cv2.THRESH_BINARY)
 
-    # Also catch near-white regions using saturation — windows have very low saturation
+    # Also catch near-white regions — windows are bright AND low saturation
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    low_sat = (hsv[:, :, 1] < 25).astype(np.uint8) * 255
-    bright_l = (L > 180).astype(np.uint8) * 255
+    low_sat = (hsv[:, :, 1] < 30).astype(np.uint8) * 255
+    bright_l = (L > 170).astype(np.uint8) * 255
     low_sat_bright = cv2.bitwise_and(low_sat, bright_l)
 
     combined = cv2.bitwise_or(bright, low_sat_bright)
 
     # Morphological cleanup
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k)
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, open_k)
 
-    # Keep only large blobs (windows are at least 0.05% of frame)
+    # Keep only large blobs (windows are at least 0.03% of frame)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
-    min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.0005
+    min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.0003
     filtered = np.zeros_like(combined)
     for i in range(1, num_labels):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             filtered[labels == i] = 255
 
-    # Feather edges for smooth blending
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=20)
+    # Feather edges
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=18)
     feathered = feathered / 255.0
 
     del lab, hsv, bright, low_sat, bright_l, low_sat_bright, combined, filtered
@@ -88,17 +88,15 @@ def detect_window_mask(img: np.ndarray, threshold: int = 195) -> np.ndarray:
 
 
 def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
-                      mask: np.ndarray, strength: float = 0.85) -> np.ndarray:
+                      mask: np.ndarray, strength: float = 0.92) -> np.ndarray:
     """
     Blend darkest exposure into blown window regions.
-    Dark image is brightened slightly so exterior detail is visible but not muddy.
+    The dark image is brightened just enough to reveal exterior detail clearly.
     """
     merged_f = merged.astype(np.float32)
-
-    # Brighten the dark image moderately so we get detail without it being too dark
     dark_f = dark_img.astype(np.float32)
-    dark_brightened = np.clip(dark_f * 1.35, 0, 255)
-
+    # Brighten dark image moderately — exterior should be visible, not too dark
+    dark_brightened = np.clip(dark_f * 1.5, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
     result = merged_f * (1.0 - mask3) + dark_brightened * mask3
     return np.clip(result, 0, 255).astype(np.uint8)
@@ -112,8 +110,8 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = img.astype(np.float32) / 255.0
 
-    # 1. Gentle gamma correction
-    f = np.power(np.clip(f, 1e-6, 1.0), 0.80)
+    # 1. Gentle gamma correction — 0.88 avoids blowing bright floors
+    f = np.power(np.clip(f, 1e-6, 1.0), 0.88)
 
     # 2. Exposure
     ev = 2.0 ** p.exposure
