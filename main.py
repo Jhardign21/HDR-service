@@ -32,12 +32,12 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.4
-    saturation: float = 1.1
-    shadows: float = 0.06
-    whites: float = 0.90
+    exposure: float = -0.20      # brighter overall to match airy target
+    saturation: float = 1.05     # near-neutral, walls should be cool gray not tan
+    shadows: float = 0.12        # strong shadow lift for airy open feel
+    whites: float = 0.92
     blacks: float = 0.01
-    temperature: float = -8.0
+    temperature: float = -18.0   # strong cooling: removes warm tan cast from walls
     window_pull: float = 0.95
 
 
@@ -89,8 +89,12 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
     filtered[:top_cut, :] = 0
     filtered[bot_cut:, :] = 0
 
-    # Heavy feathering — smooth transition, no hard edges
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=30)
+    # Erode mask inward before feathering — prevents bleeding onto frames/curtains
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+    filtered = cv2.erode(filtered, erode_k, iterations=2)
+
+    # Moderate feathering — smooth but stays inside window bounds
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=18)
     max_val = feathered.max()
     if max_val > 0:
         feathered = feathered / max_val
@@ -103,15 +107,32 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
 def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
                       mask: np.ndarray, strength: float = 0.95) -> np.ndarray:
     """
-    Blend darkest bracket into window regions.
-    Dark image is used raw (pre-tone) with a slight lift so exterior is visible.
+    Blend darkest bracket into window regions, then add subtle sky-blue tint
+    to bright exterior pixels (sky) visible through the glass.
     """
     merged_f = merged.astype(np.float32)
-    # Slight lift on dark frame: exterior should be clearly visible but not blown
     dark_f = np.clip(dark_img.astype(np.float32) * 1.2, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
-    result = merged_f * (1.0 - mask3) + dark_f * mask3
-    return np.clip(result, 0, 255).astype(np.uint8)
+    result = (merged_f * (1.0 - mask3) + dark_f * mask3)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # Sky blue tint: within the window mask, find very bright low-saturation pixels
+    # (overcast/bright sky) and add a subtle cool-blue shift
+    hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
+    brightness = hsv[:, :, 2] / 255.0   # 0-1
+    saturation = hsv[:, :, 1] / 255.0   # 0-1
+    # Sky pixels: bright (>0.55) and low saturation (<0.25) within the window region
+    sky_pixel = (brightness > 0.55) & (saturation < 0.25)
+    sky_strength = mask * sky_pixel.astype(np.float32) * 0.5  # max 50% of mask
+
+    result_f = result.astype(np.float32)
+    # BGR: add blue (+12), slight green (+3), reduce red (-8)
+    result_f[:, :, 0] = np.clip(result_f[:, :, 0] + sky_strength * 12, 0, 255)  # B
+    result_f[:, :, 1] = np.clip(result_f[:, :, 1] + sky_strength * 3,  0, 255)  # G
+    result_f[:, :, 2] = np.clip(result_f[:, :, 2] - sky_strength * 8,  0, 255)  # R
+
+    del hsv, brightness, saturation, sky_pixel, sky_strength
+    return np.clip(result_f, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -154,15 +175,16 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
         f[:, :, 1] = np.clip(f[:, :, 1] + shift * 0.2, 0, 1)  # Green (slight)
         f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.6, 0, 1)  # Red
 
-    # 9. Gray-world white balance (neutralize warmth)
+    # 9. Gray-world white balance (neutralize warmth — push toward cool neutral)
     mean_b = float(np.mean(f[:, :, 0]))
     mean_g = float(np.mean(f[:, :, 1]))
     mean_r = float(np.mean(f[:, :, 2]))
     mean_all = (mean_b + mean_g + mean_r) / 3.0
     if mean_all > 0.01:
-        f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 0.97, 0, 1)
-        f[:, :, 1] = np.clip(f[:, :, 1] * (mean_all / mean_g) * 0.99, 0, 1)
-        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 1.00, 0, 1)
+        # Stronger blue boost + red suppression to push walls from tan → cool gray
+        f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 1.02, 0, 1)   # Blue +
+        f[:, :, 1] = np.clip(f[:, :, 1] * (mean_all / mean_g) * 0.99, 0, 1)   # Green neutral
+        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 0.96, 0, 1)   # Red -
 
     # 10. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
@@ -361,4 +383,3 @@ async def merge_hdr(req: MergeRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
