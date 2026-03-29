@@ -78,6 +78,12 @@ def detect_window_mask(img: np.ndarray, threshold: int = 185) -> np.ndarray:
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             filtered[labels == i] = 255
 
+    # CRITICAL: Zero out the bottom 45% of the image — floors reflect light
+    # and get misidentified as windows. Windows only exist in the upper portion.
+    height = filtered.shape[0]
+    cutoff = int(height * 0.55)  # only keep mask above 55% height
+    filtered[cutoff:, :] = 0
+
     # Feather edges
     feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=18)
     feathered = feathered / 255.0
@@ -95,8 +101,8 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
     """
     merged_f = merged.astype(np.float32)
     dark_f = dark_img.astype(np.float32)
-    # Brighten dark image moderately — exterior should be visible, not too dark
-    dark_brightened = np.clip(dark_f * 1.5, 0, 255)
+    # Brighten dark image so exterior detail is clearly visible
+    dark_brightened = np.clip(dark_f * 1.8, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
     result = merged_f * (1.0 - mask3) + dark_brightened * mask3
     return np.clip(result, 0, 255).astype(np.uint8)
