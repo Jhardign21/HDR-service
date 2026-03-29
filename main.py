@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.20      # brighter overall to match airy target
-    saturation: float = 1.05     # near-neutral, walls should be cool gray not tan
-    shadows: float = 0.12        # strong shadow lift for airy open feel
+    exposure: float = -0.20
+    saturation: float = 1.05
+    shadows: float = 0.12
     whites: float = 0.92
     blacks: float = 0.01
-    temperature: float = -18.0   # strong cooling: removes warm tan cast from walls
-    window_pull: float = 0.95
+    temperature: float = -25.0   # stronger cooling to push tan walls → cool gray
+    window_pull: float = 0.90    # slightly less to reduce curtain bleed
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +91,10 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
 
     # Erode mask inward before feathering — prevents bleeding onto frames/curtains
     erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-    filtered = cv2.erode(filtered, erode_k, iterations=2)
+    filtered = cv2.erode(filtered, erode_k, iterations=3)  # more aggressive: no curtain bleed
 
-    # Moderate feathering — smooth but stays inside window bounds
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=18)
+    # Tight feathering — stays strictly inside glass area
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=10)
     max_val = feathered.max()
     if max_val > 0:
         feathered = feathered / max_val
@@ -159,10 +159,9 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 5. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
 
-    # 6. Highlight rolloff — compress highlights above 72% to prevent floor blowout
-    # This is the key fix: smooth tone rolloff preserves floor texture
-    hi = np.clip((f - 0.72) / 0.28, 0, 1)
-    f = f - hi * (f - 0.72) * 0.55
+    # 6. Highlight rolloff — compress highlights above 65% to preserve floor grain
+    hi = np.clip((f - 0.65) / 0.35, 0, 1)
+    f = f - hi * (f - 0.65) * 0.60
     f = np.clip(f, 0, 1)
 
     # 7. Mild S-curve
@@ -181,10 +180,10 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     mean_r = float(np.mean(f[:, :, 2]))
     mean_all = (mean_b + mean_g + mean_r) / 3.0
     if mean_all > 0.01:
-        # Stronger blue boost + red suppression to push walls from tan → cool gray
-        f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 1.02, 0, 1)   # Blue +
+        # Strong blue boost + red suppression: tan → cool neutral gray walls
+        f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 1.03, 0, 1)   # Blue ++
         f[:, :, 1] = np.clip(f[:, :, 1] * (mean_all / mean_g) * 0.99, 0, 1)   # Green neutral
-        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 0.96, 0, 1)   # Red -
+        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 0.94, 0, 1)   # Red --
 
     # 10. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
