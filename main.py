@@ -32,100 +32,105 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.35       # darker overall to preserve floor texture
+    exposure: float = -0.4
     saturation: float = 1.1
-    shadows: float = 0.08
-    whites: float = 0.88          # lower whites ceiling = more floor detail
+    shadows: float = 0.06
+    whites: float = 0.90
     blacks: float = 0.01
-    temperature: float = -10.0
-    window_pull: float = 0.92
+    temperature: float = -8.0
+    window_pull: float = 0.95
 
 
 # ---------------------------------------------------------------------------
-# Window detection & pull
+# Window detection — real estate grade
 # ---------------------------------------------------------------------------
 
-def detect_window_mask(img: np.ndarray, threshold: int = 185) -> np.ndarray:
+def detect_window_mask(img: np.ndarray) -> np.ndarray:
     """
-    Detects blown-out / very bright regions (windows) via LAB luminance.
-    Returns a float32 feathered mask [0..1].
+    Detect blown-out window/glass regions only.
+    - Uses LAB luminance for primary detection
+    - Excludes ceiling (top 10%) and floor (bottom 42%)
+    - Requires large connected blobs (windows, not fixtures)
+    - Heavy feathering for seamless blending
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]  # 0-255
 
-    # Primary: very bright pixels
-    _, bright = cv2.threshold(L, threshold, 255, cv2.THRESH_BINARY)
+    # Primary: truly blown pixels (L > 205)
+    _, blown = cv2.threshold(L, 205, 255, cv2.THRESH_BINARY)
 
-    # Also catch near-white regions — windows are bright AND low saturation
+    # Secondary: high-brightness + very low saturation (window glass / sky)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    low_sat = (hsv[:, :, 1] < 30).astype(np.uint8) * 255
-    bright_l = (L > 170).astype(np.uint8) * 255
-    low_sat_bright = cv2.bitwise_and(low_sat, bright_l)
+    low_sat = (hsv[:, :, 1] < 18).astype(np.uint8) * 255
+    bright_l = (L > 192).astype(np.uint8) * 255
+    window_glass = cv2.bitwise_and(low_sat, bright_l)
 
-    combined = cv2.bitwise_or(bright, low_sat_bright)
+    combined = cv2.bitwise_or(blown, window_glass)
 
-    # Morphological cleanup
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Morphological: close gaps inside window frame, remove small noise
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k)
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, open_k)
 
-    # Keep only large blobs (windows are at least 0.03% of frame)
+    # Only keep large blobs — windows are big; ceiling fixtures are small
+    # Minimum 0.25% of frame area
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
-    min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.0003
+    min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.0025
     filtered = np.zeros_like(combined)
     for i in range(1, num_labels):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             filtered[labels == i] = 255
 
-    # CRITICAL: Zero out the bottom 45% of the image — floors reflect light
-    # and get misidentified as windows. Windows only exist in the upper portion.
     height = filtered.shape[0]
-    cutoff = int(height * 0.55)  # only keep mask above 55% height
-    filtered[cutoff:, :] = 0
+    # Exclude top 10% (ceiling lights/fixtures) and bottom 42% (floors reflect light)
+    top_cut = int(height * 0.10)
+    bot_cut = int(height * 0.58)
+    filtered[:top_cut, :] = 0
+    filtered[bot_cut:, :] = 0
 
-    # Feather edges
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=18)
-    feathered = feathered / 255.0
+    # Heavy feathering — smooth transition, no hard edges
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=30)
+    max_val = feathered.max()
+    if max_val > 0:
+        feathered = feathered / max_val
 
-    del lab, hsv, bright, low_sat, bright_l, low_sat_bright, combined, filtered
+    del lab, hsv, blown, low_sat, bright_l, window_glass, combined, filtered
     gc.collect()
     return feathered
 
 
 def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
-                      mask: np.ndarray, strength: float = 0.92) -> np.ndarray:
+                      mask: np.ndarray, strength: float = 0.95) -> np.ndarray:
     """
-    Blend darkest exposure into blown window regions.
-    The dark image is brightened just enough to reveal exterior detail clearly.
+    Blend darkest bracket into window regions.
+    Dark image is used raw (pre-tone) with a slight lift so exterior is visible.
     """
     merged_f = merged.astype(np.float32)
-    dark_f = dark_img.astype(np.float32)
-    # Use dark image as-is — no brightening, we WANT the underexposed exterior detail
+    # Slight lift on dark frame: exterior should be clearly visible but not blown
+    dark_f = np.clip(dark_img.astype(np.float32) * 1.2, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
     result = merged_f * (1.0 - mask3) + dark_f * mask3
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
-# Tone pipeline — tuned to match professional real estate style:
-# cool-neutral gray walls, crisp whites, balanced exposure
+# Tone pipeline
 # ---------------------------------------------------------------------------
 
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = img.astype(np.float32) / 255.0
 
-    # 1. Gentle gamma correction — 0.88 avoids blowing bright floors
-    f = np.power(np.clip(f, 1e-6, 1.0), 0.88)
+    # 1. Gentle gamma lift (0.90 keeps brights from clipping)
+    f = np.power(np.clip(f, 1e-6, 1.0), 0.90)
 
     # 2. Exposure
     ev = 2.0 ** p.exposure
     f = np.clip(f * ev, 0, 1)
 
-    # 3. Shadow lift (gentle)
-    shadow_mask = np.clip(1.0 - f / 0.35, 0, 1)
-    f = f + shadow_mask * p.shadows
-    f = np.clip(f, 0, 1)
+    # 3. Shadow lift
+    shadow_mask = np.clip(1.0 - f / 0.30, 0, 1)
+    f = np.clip(f + shadow_mask * p.shadows, 0, 1)
 
     # 4. Black floor
     f = f * (1.0 - p.blacks) + p.blacks
@@ -133,25 +138,23 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 5. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
 
-    # 5b. Highlight rolloff — compress very bright areas (prevents floor blowout)
-    # Smoothly compress anything above 0.80 so highlights retain texture
-    hi_mask = np.clip((f - 0.80) / 0.20, 0, 1)
-    f = f - hi_mask * (f - 0.80) * 0.45
+    # 6. Highlight rolloff — compress highlights above 72% to prevent floor blowout
+    # This is the key fix: smooth tone rolloff preserves floor texture
+    hi = np.clip((f - 0.72) / 0.28, 0, 1)
+    f = f - hi * (f - 0.72) * 0.55
     f = np.clip(f, 0, 1)
 
-    # 6. Mild S-curve for contrast
+    # 7. Mild S-curve
     f = f * f * (3.0 - 2.0 * f)
 
-    # 7. Temperature shift — negative = cooler (remove warmth)
+    # 8. Temperature shift (cool)
     if abs(p.temperature) > 0.5:
-        shift = p.temperature / 500.0  # small shift
-        # Cool: reduce red, boost blue slightly
-        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)   # Blue (BGR)
-        f[:, :, 1] = np.clip(f[:, :, 1] + shift * 0.2, 0, 1)  # Green slight
+        shift = p.temperature / 500.0
+        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)        # Blue
+        f[:, :, 1] = np.clip(f[:, :, 1] + shift * 0.2, 0, 1)  # Green (slight)
         f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.6, 0, 1)  # Red
 
-    # 8. Gray-world white balance correction (neutral walls)
-    # Only correct if image is actually warm-biased
+    # 9. Gray-world white balance (neutralize warmth)
     mean_b = float(np.mean(f[:, :, 0]))
     mean_g = float(np.mean(f[:, :, 1]))
     mean_r = float(np.mean(f[:, :, 2]))
@@ -159,17 +162,17 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     if mean_all > 0.01:
         f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 0.97, 0, 1)
         f[:, :, 1] = np.clip(f[:, :, 1] * (mean_all / mean_g) * 0.99, 0, 1)
-        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 1.0, 0, 1)
+        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 1.00, 0, 1)
 
-    # 9. Saturation
+    # 10. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] * p.saturation, 0, 255)
     result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # 10. Gentle sharpening
+    # 11. Gentle sharpening
     blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=1.2)
-    result = cv2.addWeighted(result, 1.35, blurred, -0.35, 0)
+    result = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
 
     del f, hsv, blurred
     gc.collect()
@@ -248,9 +251,9 @@ def align_images(images: List[np.ndarray]) -> List[np.ndarray]:
 
 
 def merge_mertens(images: List[np.ndarray]) -> np.ndarray:
-    # Use higher contrast weight to preserve detail, lower exposure weight to avoid halos
+    # Higher contrast weight catches detail, moderate exposure weight avoids halos
     fused = cv2.createMergeMertens(
-        contrast_weight=1.2, saturation_weight=1.0, exposure_weight=0.1
+        contrast_weight=1.4, saturation_weight=0.9, exposure_weight=0.2
     ).process(images)
     result = np.clip(fused * 255, 0, 255).astype(np.uint8)
     del fused
@@ -287,7 +290,7 @@ async def merge_hdr(req: MergeRequest):
         images = [load_image_bgr(path) for path in tmp_paths]
         gc.collect()
 
-        # Store dark image BEFORE alignment (preserves original underexposed detail)
+        # Grab dark image BEFORE alignment — raw underexposed frame for window pull
         dark_img = get_darkest_image(images)
 
         if len(images) > 1:
@@ -298,32 +301,27 @@ async def merge_hdr(req: MergeRequest):
             del images
             gc.collect()
 
-        # Detect window mask on merged (before tone) — merged shows blown windows clearly
+        # Detect windows on merged (blown windows clearly visible here)
         window_mask = None
         if p.window_pull > 0:
             print("Detecting windows...")
-            window_mask = detect_window_mask(merged, threshold=190)
+            window_mask = detect_window_mask(merged)
             window_coverage = float(np.mean(window_mask))
             print(f"Window mask coverage: {window_coverage:.4f}")
-            if window_coverage <= 0.0005:
+            if window_coverage <= 0.0003:
                 print("No significant window regions detected")
                 window_mask = None
 
-        # Tone mapping first
+        # Tone map the merged image
         toned = apply_tone(merged, p)
         del merged
         gc.collect()
 
-        # Apply window pull AFTER tone mapping so exterior detail is NOT brightened by tone pipeline
+        # Apply window pull AFTER tone mapping
+        # Use raw dark_img (not tone-mapped) with slight lift — preserves natural exterior look
         if window_mask is not None and p.window_pull > 0:
-            # Tone-map the dark image too so color is consistent, but preserve its darkness
-            dark_toned = apply_tone(dark_img, p)
-            # Then pull it back down to preserve dark exterior — scale by 0.65 to keep it dark
-            dark_for_windows = np.clip(dark_toned.astype(np.float32) * 0.65, 0, 255).astype(np.uint8)
-            del dark_toned
-            print(f"Applying window pull after tone (strength={p.window_pull})...")
-            toned = apply_window_pull(toned, dark_for_windows, window_mask, strength=p.window_pull)
-            del dark_for_windows
+            print(f"Applying window pull (strength={p.window_pull})...")
+            toned = apply_window_pull(toned, dark_img, window_mask, strength=p.window_pull)
 
         del dark_img
         gc.collect()
