@@ -355,3 +355,12 @@ async def merge_hdr(req: MergeRequest):
     finally:
         for path in tmp_paths:
             try:
+                os.unlink(path)
+            except Exception:
+                pass
+        gc.collect()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
