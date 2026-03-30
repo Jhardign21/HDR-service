@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = 0.18       # modest lift — prevents ceiling blow-out
+    exposure: float = 0.32
     saturation: float = 1.0
-    shadows: float = 0.28        # lift dark corners without bleaching
-    whites: float = 0.92
+    shadows: float = 0.42        # strong lift — eliminates dark corners/ceiling
+    whites: float = 0.89
     blacks: float = 0.02
     temperature: float = 0.0
-    window_pull: float = 0.55
+    window_pull: float = 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +142,8 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = img.astype(np.float32) / 255.0
 
-    # 1. Gentle gamma lift (0.95 — softer, preserves highlight texture)
-    f = np.power(np.clip(f, 1e-6, 1.0), 0.95)
+    # 1. Gentle gamma lift (0.90 keeps brights from clipping)
+    f = np.power(np.clip(f, 1e-6, 1.0), 0.90)
 
     # 2. Exposure
     ev = 2.0 ** p.exposure
@@ -159,9 +159,9 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 5. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
 
-    # 6. Highlight rolloff — compress highlights above 60% to protect ceiling texture
-    hi = np.clip((f - 0.60) / 0.40, 0, 1)
-    f = f - hi * (f - 0.60) * 0.70
+    # 6. Highlight rolloff — compress highlights above 65% to preserve floor grain
+    hi = np.clip((f - 0.65) / 0.35, 0, 1)
+    f = f - hi * (f - 0.65) * 0.60
     f = np.clip(f, 0, 1)
 
     # 7. Mild S-curve
