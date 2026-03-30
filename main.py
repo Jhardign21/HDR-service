@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = 0.10       # bright airy look — target is well-lit
+    exposure: float = 0.10
     saturation: float = 1.08
-    shadows: float = 0.15
-    whites: float = 0.93         # gentle ceiling, keeps interior bright
+    shadows: float = 0.28        # strong shadow lift — removes ceiling/wall darkness
+    whites: float = 0.93
     blacks: float = 0.01
-    temperature: float = 0.0     # preserve natural room warmth
-    window_pull: float = 0.75    # moderate — reveal exterior, don't black it out
+    temperature: float = 0.0
+    window_pull: float = 0.80
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +107,17 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
 
 
 def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
-                      mask: np.ndarray, strength: float = 0.75) -> np.ndarray:
+                      mask: np.ndarray, strength: float = 0.80) -> np.ndarray:
     """
-    Pull down window regions using a darkened version of the MERGED image
-    (not the raw dark bracket which is near-black and destroys the window).
-    This reveals exterior detail at a natural exposure level.
+    Blend brightened dark bracket into window regions to reveal exterior.
+    Multiply dark bracket by 2.0 so exterior scene (street, trees) is visible
+    rather than near-black.
     """
     merged_f = merged.astype(np.float32)
-    # Use merged * 0.45 as the window target: pulls highlights back while
-    # keeping exterior scene visible (fence, trees, sky detail)
-    window_target = np.clip(merged_f * 0.45, 0, 255)
+    # Brighten the dark bracket significantly so exterior is naturally exposed
+    dark_f = np.clip(dark_img.astype(np.float32) * 2.0, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
-    result = np.clip(merged_f * (1.0 - mask3) + window_target * mask3, 0, 255).astype(np.uint8)
+    result = np.clip(merged_f * (1.0 - mask3) + dark_f * mask3, 0, 255).astype(np.uint8)
 
     # Subtle sky-blue tint on very bright, low-sat window pixels
     hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
