@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.30      # pull back to prevent floor blowout
-    saturation: float = 1.05
-    shadows: float = 0.10
-    whites: float = 0.90         # tighter whites ceiling
+    exposure: float = -0.20      # bright airy look
+    saturation: float = 1.08
+    shadows: float = 0.18        # lift dark corners
+    whites: float = 0.85         # tight ceiling to prevent blowout without darkening interior
     blacks: float = 0.01
-    temperature: float = -15.0   # moderate cooling — neutral gray, not blue
-    window_pull: float = 0.90
+    temperature: float = 0.0     # no global shift — preserve room's natural warmth
+    window_pull: float = 0.92
 
 
 # ---------------------------------------------------------------------------
@@ -47,59 +47,61 @@ class ProcessingParams(BaseModel):
 
 def detect_window_mask(img: np.ndarray) -> np.ndarray:
     """
-    Detect blown-out window/glass regions only.
-    - Uses LAB luminance for primary detection
-    - Excludes ceiling (top 10%) and floor (bottom 42%)
-    - Requires large connected blobs (windows, not fixtures)
-    - Heavy feathering for seamless blending
+    Detect the full window/glass opening — not just blown highlights.
+    Strategy: find blown cores first, then dilate aggressively to cover
+    the entire window frame area (including darker pane regions like fences).
+    Then erode back inward to exclude curtains/frames before feathering.
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0]  # 0-255
 
-    # Primary: truly blown pixels (L > 205)
-    _, blown = cv2.threshold(L, 205, 255, cv2.THRESH_BINARY)
+    # Step 1: seed = truly blown pixels (L > 200)
+    _, blown = cv2.threshold(L, 200, 255, cv2.THRESH_BINARY)
 
-    # Secondary: high-brightness + very low saturation (window glass / sky)
+    # Also seed on high-brightness + low-sat (glass areas)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    low_sat = (hsv[:, :, 1] < 18).astype(np.uint8) * 255
-    bright_l = (L > 192).astype(np.uint8) * 255
+    low_sat = (hsv[:, :, 1] < 25).astype(np.uint8) * 255
+    bright_l = (L > 185).astype(np.uint8) * 255
     window_glass = cv2.bitwise_and(low_sat, bright_l)
+    seed = cv2.bitwise_or(blown, window_glass)
 
-    combined = cv2.bitwise_or(blown, window_glass)
+    # Step 2: close small gaps, remove tiny noise
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, close_k)
+    seed = cv2.morphologyEx(seed, cv2.MORPH_OPEN, open_k)
 
-    # Morphological: close gaps inside window frame, remove small noise
-    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
-    open_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, open_k)
-
-    # Only keep large blobs — windows are big; ceiling fixtures are small
-    # Minimum 0.25% of frame area
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combined, connectivity=8)
+    # Step 3: keep only large blobs (real windows, not fixtures)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(seed, connectivity=8)
     min_area = (OUTPUT_WIDTH * OUTPUT_HEIGHT) * 0.0025
-    filtered = np.zeros_like(combined)
+    filtered = np.zeros_like(seed)
     for i in range(1, num_labels):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             filtered[labels == i] = 255
 
-    height = filtered.shape[0]
-    # Exclude top 10% (ceiling lights/fixtures) and bottom 42% (floors reflect light)
+    # Step 4: DILATE blobs to cover the entire window opening
+    # This fills in darker pane areas (fence, lower sash) attached to the blown core
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (60, 60))
+    expanded = cv2.dilate(filtered, dilate_k, iterations=2)
+
+    # Step 5: restrict to valid vertical band (exclude ceiling 10%, floor 55%)
+    height = expanded.shape[0]
     top_cut = int(height * 0.10)
-    bot_cut = int(height * 0.58)
-    filtered[:top_cut, :] = 0
-    filtered[bot_cut:, :] = 0
+    bot_cut = int(height * 0.55)
+    expanded[:top_cut, :] = 0
+    expanded[bot_cut:, :] = 0
 
-    # Erode mask inward — stays inside glass, prevents curtain bleed
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    filtered = cv2.erode(filtered, erode_k, iterations=2)  # moderate: mask survives but no bleed
+    # Step 6: erode inward to pull mask away from curtains and window frames
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (18, 18))
+    shrunk = cv2.erode(expanded, erode_k, iterations=3)
 
-    # Moderate feathering
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=8)
+    # Step 7: moderate feathering — smooth blend inside glass only
+    feathered = cv2.GaussianBlur(shrunk.astype(np.float32), (0, 0), sigmaX=8)
     max_val = feathered.max()
     if max_val > 0:
         feathered = feathered / max_val
 
-    del lab, hsv, blown, low_sat, bright_l, window_glass, combined, filtered
+    del lab, hsv, blown, low_sat, bright_l, window_glass, seed, filtered, expanded, shrunk
     gc.collect()
     return feathered
 
@@ -167,36 +169,21 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 7. Mild S-curve
     f = f * f * (3.0 - 2.0 * f)
 
-    # 8. Temperature shift (cool) — midtone-only, spares bright floor/ceiling
+    # 8. Optional temperature shift (user-controlled, off by default)
     lum = (f[:, :, 0] + f[:, :, 1] + f[:, :, 2]) / 3.0
-    # Full effect on midtones (<0.70), fades to zero on bright pixels (>0.80)
-    mid_mask = np.clip((0.80 - lum) / 0.25, 0, 1)
+    mid_mask = np.clip((0.75 - lum) / 0.25, 0, 1)
     mid_mask3 = np.stack([mid_mask] * 3, axis=2)
 
     if abs(p.temperature) > 0.5:
         shift = p.temperature / 500.0
         delta = np.zeros_like(f)
-        delta[:, :, 2] += shift        # Blue
-        delta[:, :, 1] += shift * 0.2  # Green slight
-        delta[:, :, 0] -= shift * 0.6  # Red
+        delta[:, :, 2] += shift
+        delta[:, :, 1] += shift * 0.2
+        delta[:, :, 0] -= shift * 0.6
         f = np.clip(f + delta * mid_mask3, 0, 1)
 
-    # 9. Gray-world white balance — midtone-only, keeps warm floor color
-    mean_b = float(np.mean(f[:, :, 0]))
-    mean_g = float(np.mean(f[:, :, 1]))
-    mean_r = float(np.mean(f[:, :, 2]))
-    mean_all = (mean_b + mean_g + mean_r) / 3.0
-    if mean_all > 0.01:
-        # Moderate correction: cool walls to neutral gray without going blue
-        wb_b = np.full_like(f[:, :, 0], (mean_all / mean_b) * 1.02)
-        wb_g = np.full_like(f[:, :, 1], (mean_all / mean_g) * 0.99)
-        wb_r = np.full_like(f[:, :, 2], (mean_all / mean_r) * 0.96)
-        scale_b = 1.0 + (wb_b - 1.0) * mid_mask
-        scale_g = 1.0 + (wb_g - 1.0) * mid_mask
-        scale_r = 1.0 + (wb_r - 1.0) * mid_mask
-        f[:, :, 0] = np.clip(f[:, :, 0] * scale_b, 0, 1)
-        f[:, :, 1] = np.clip(f[:, :, 1] * scale_g, 0, 1)
-        f[:, :, 2] = np.clip(f[:, :, 2] * scale_r, 0, 1)
+    # 9. NO gray-world WB — removed: it fights warm-toned rooms (cream/peach walls,
+    # honey wood floors) and produces blue casts. Camera WB is preserved from rawpy.
 
     del lum, mid_mask, mid_mask3
 
