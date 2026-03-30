@@ -37,8 +37,8 @@ class ProcessingParams(BaseModel):
     shadows: float = 0.12
     whites: float = 0.92
     blacks: float = 0.01
-    temperature: float = -25.0   # stronger cooling to push tan walls → cool gray
-    window_pull: float = 0.90    # slightly less to reduce curtain bleed
+    temperature: float = -30.0   # push tan walls fully → cool neutral gray
+    window_pull: float = 0.80    # gentler pull to avoid halo/ghost artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -89,12 +89,12 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
     filtered[:top_cut, :] = 0
     filtered[bot_cut:, :] = 0
 
-    # Erode mask inward before feathering — prevents bleeding onto frames/curtains
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-    filtered = cv2.erode(filtered, erode_k, iterations=3)  # more aggressive: no curtain bleed
+    # Erode mask inward — must stay strictly inside glass, never touch curtains/frames
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    filtered = cv2.erode(filtered, erode_k, iterations=5)  # very aggressive: kills curtain bleed
 
-    # Tight feathering — stays strictly inside glass area
-    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=10)
+    # Very tight feathering — minimal spread to prevent halo
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=6)
     max_val = feathered.max()
     if max_val > 0:
         feathered = feathered / max_val
@@ -167,23 +167,40 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 7. Mild S-curve
     f = f * f * (3.0 - 2.0 * f)
 
-    # 8. Temperature shift (cool)
+    # 8. Temperature shift (cool) — midtone-only mask protects bright floor/ceiling
+    # Luminance of each pixel: protect highlights (floor ~0.85+) from blue push
+    lum = (f[:, :, 0] + f[:, :, 1] + f[:, :, 2]) / 3.0
+    # Weight: full strength on midtones (0.3-0.7), fades to 0 on highlights (>0.82)
+    mid_mask = np.clip((0.82 - lum) / 0.30, 0, 1)  # shape (H,W)
+    mid_mask3 = np.stack([mid_mask] * 3, axis=2)
+
     if abs(p.temperature) > 0.5:
         shift = p.temperature / 500.0
-        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)        # Blue
-        f[:, :, 1] = np.clip(f[:, :, 1] + shift * 0.2, 0, 1)  # Green (slight)
-        f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.6, 0, 1)  # Red
+        delta = np.zeros_like(f)
+        delta[:, :, 2] += shift        # Blue channel
+        delta[:, :, 1] += shift * 0.2  # Green (slight)
+        delta[:, :, 0] -= shift * 0.6  # Red
+        f = np.clip(f + delta * mid_mask3, 0, 1)
 
-    # 9. Gray-world white balance (neutralize warmth — push toward cool neutral)
+    # 9. Gray-world white balance — midtone-only to preserve warm floor tone
     mean_b = float(np.mean(f[:, :, 0]))
     mean_g = float(np.mean(f[:, :, 1]))
     mean_r = float(np.mean(f[:, :, 2]))
     mean_all = (mean_b + mean_g + mean_r) / 3.0
     if mean_all > 0.01:
-        # Strong blue boost + red suppression: tan → cool neutral gray walls
-        f[:, :, 0] = np.clip(f[:, :, 0] * (mean_all / mean_b) * 1.03, 0, 1)   # Blue ++
-        f[:, :, 1] = np.clip(f[:, :, 1] * (mean_all / mean_g) * 0.99, 0, 1)   # Green neutral
-        f[:, :, 2] = np.clip(f[:, :, 2] * (mean_all / mean_r) * 0.94, 0, 1)   # Red --
+        # Compute per-pixel WB correction blended with mid_mask
+        wb_b = np.full_like(f[:, :, 0], (mean_all / mean_b) * 1.04)
+        wb_g = np.full_like(f[:, :, 1], (mean_all / mean_g) * 0.99)
+        wb_r = np.full_like(f[:, :, 2], (mean_all / mean_r) * 0.92)
+        # Blend: midtones get full WB correction, highlights stay unchanged (scale=1.0)
+        scale_b = 1.0 + (wb_b - 1.0) * mid_mask
+        scale_g = 1.0 + (wb_g - 1.0) * mid_mask
+        scale_r = 1.0 + (wb_r - 1.0) * mid_mask
+        f[:, :, 0] = np.clip(f[:, :, 0] * scale_b, 0, 1)
+        f[:, :, 1] = np.clip(f[:, :, 1] * scale_g, 0, 1)
+        f[:, :, 2] = np.clip(f[:, :, 2] * scale_r, 0, 1)
+
+    del lum, mid_mask, mid_mask3
 
     # 10. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
