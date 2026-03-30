@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = -0.20      # bright airy look
+    exposure: float = 0.10       # bright airy look — target is well-lit
     saturation: float = 1.08
-    shadows: float = 0.18        # lift dark corners
-    whites: float = 0.85         # tight ceiling to prevent blowout without darkening interior
+    shadows: float = 0.15
+    whites: float = 0.93         # gentle ceiling, keeps interior bright
     blacks: float = 0.01
-    temperature: float = 0.0     # no global shift — preserve room's natural warmth
-    window_pull: float = 0.92
+    temperature: float = 0.0     # preserve natural room warmth
+    window_pull: float = 0.75    # moderate — reveal exterior, don't black it out
 
 
 # ---------------------------------------------------------------------------
@@ -91,9 +91,9 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
     expanded[:top_cut, :] = 0
     expanded[bot_cut:, :] = 0
 
-    # Step 6: erode inward to pull mask away from curtains and window frames
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (18, 18))
-    shrunk = cv2.erode(expanded, erode_k, iterations=3)
+    # Step 6: erode inward aggressively to stay strictly inside glass, away from frames
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (22, 22))
+    shrunk = cv2.erode(expanded, erode_k, iterations=5)
 
     # Step 7: moderate feathering — smooth blend inside glass only
     feathered = cv2.GaussianBlur(shrunk.astype(np.float32), (0, 0), sigmaX=8)
@@ -107,31 +107,30 @@ def detect_window_mask(img: np.ndarray) -> np.ndarray:
 
 
 def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
-                      mask: np.ndarray, strength: float = 0.95) -> np.ndarray:
+                      mask: np.ndarray, strength: float = 0.75) -> np.ndarray:
     """
-    Blend darkest bracket into window regions, then add subtle sky-blue tint
-    to bright exterior pixels (sky) visible through the glass.
+    Pull down window regions using a darkened version of the MERGED image
+    (not the raw dark bracket which is near-black and destroys the window).
+    This reveals exterior detail at a natural exposure level.
     """
     merged_f = merged.astype(np.float32)
-    dark_f = np.clip(dark_img.astype(np.float32) * 1.2, 0, 255)
+    # Use merged * 0.45 as the window target: pulls highlights back while
+    # keeping exterior scene visible (fence, trees, sky detail)
+    window_target = np.clip(merged_f * 0.45, 0, 255)
     mask3 = np.stack([mask * strength] * 3, axis=2)
-    result = (merged_f * (1.0 - mask3) + dark_f * mask3)
-    result = np.clip(result, 0, 255).astype(np.uint8)
+    result = np.clip(merged_f * (1.0 - mask3) + window_target * mask3, 0, 255).astype(np.uint8)
 
-    # Sky blue tint: within the window mask, find very bright low-saturation pixels
-    # (overcast/bright sky) and add a subtle cool-blue shift
+    # Subtle sky-blue tint on very bright, low-sat window pixels
     hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
-    brightness = hsv[:, :, 2] / 255.0   # 0-1
-    saturation = hsv[:, :, 1] / 255.0   # 0-1
-    # Sky pixels: bright (>0.55) and low saturation (<0.25) within the window region
+    brightness = hsv[:, :, 2] / 255.0
+    saturation = hsv[:, :, 1] / 255.0
     sky_pixel = (brightness > 0.55) & (saturation < 0.25)
-    sky_strength = mask * sky_pixel.astype(np.float32) * 0.5  # max 50% of mask
+    sky_strength = mask * sky_pixel.astype(np.float32) * 0.4
 
     result_f = result.astype(np.float32)
-    # BGR: add blue (+12), slight green (+3), reduce red (-8)
-    result_f[:, :, 0] = np.clip(result_f[:, :, 0] + sky_strength * 12, 0, 255)  # B
-    result_f[:, :, 1] = np.clip(result_f[:, :, 1] + sky_strength * 3,  0, 255)  # G
-    result_f[:, :, 2] = np.clip(result_f[:, :, 2] - sky_strength * 8,  0, 255)  # R
+    result_f[:, :, 0] = np.clip(result_f[:, :, 0] + sky_strength * 10, 0, 255)
+    result_f[:, :, 1] = np.clip(result_f[:, :, 1] + sky_strength * 3,  0, 255)
+    result_f[:, :, 2] = np.clip(result_f[:, :, 2] - sky_strength * 6,  0, 255)
 
     del hsv, brightness, saturation, sky_pixel, sky_strength
     return np.clip(result_f, 0, 255).astype(np.uint8)
