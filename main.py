@@ -32,13 +32,13 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    exposure: float = 0.10
-    saturation: float = 1.08
-    shadows: float = 0.28        # strong shadow lift — removes ceiling/wall darkness
-    whites: float = 0.93
-    blacks: float = 0.01
+    exposure: float = 0.32
+    saturation: float = 1.0
+    shadows: float = 0.42        # strong lift — eliminates dark corners/ceiling
+    whites: float = 0.89
+    blacks: float = 0.02
     temperature: float = 0.0
-    window_pull: float = 0.80
+    window_pull: float = 0.60
 
 
 # ---------------------------------------------------------------------------
