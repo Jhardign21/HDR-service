@@ -148,7 +148,7 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     h, w = img.shape[:2]
 
     # --- Step 1: Barrel distortion correction ---
-    k1, k2, p1, p2 = -0.18, 0.06, 0.0, 0.0
+    k1, k2, p1, p2 = -0.22, 0.07, 0.0, 0.0
     fx = fy = w * 1.05
     cx, cy = w / 2.0, h / 2.0
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
@@ -178,11 +178,11 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     if len(drifts) >= 4:
         median_drift = float(np.median(drifts))
         # Only correct if there is meaningful convergence
-        if abs(median_drift) > 0.005:
-            # Clamp correction to avoid over-warp
-            correction = np.clip(median_drift, -0.08, 0.08)
-            # Build a perspective transform that shifts top edge opposite to drift
-            shift = correction * h * 0.5
+        if abs(median_drift) > 0.004:
+            # Stronger clamp to allow real-estate lens corrections
+            correction = np.clip(median_drift, -0.14, 0.14)
+            # Amplify the shift — real-estate lenses need aggressive vertical fix
+            shift = correction * h * 0.85
             src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
             dst = np.float32([
                 [shift,        0],
