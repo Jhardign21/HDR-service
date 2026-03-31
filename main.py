@@ -189,89 +189,56 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     undistorted = cv2.undistort(img, K, dist_coeffs, None, new_K)
     print(f"Adaptive barrel: k1={k1:.3f} (from {len(h_curvatures)} h-lines)")
 
-    # Re-detect lines on undistorted image for VP step
+    # --- Step 3: Measure average lean of vertical lines directly ---
+    # More reliable than VP intersection: compute each near-vertical line's
+    # angle from true vertical, take the median, apply exact perspective shear.
     gray2 = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
     gray2_eq = cv2.equalizeHist(gray2)
     edges2 = cv2.Canny(gray2_eq, 30, 100, apertureSize=3)
-    lines2 = cv2.HoughLinesP(edges2, 1, np.pi / 180, threshold=50,
-                             minLineLength=h // 7, maxLineGap=20)
+    lines2 = cv2.HoughLinesP(edges2, 1, np.pi / 180, threshold=60,
+                             minLineLength=h // 6, maxLineGap=15)
 
-    # --- Step 3: Vanishing point detection for vertical convergence ---
-    # Collect near-vertical lines as (x1,y1,x2,y2)
-    vert_lines = []
+    lean_angles = []  # degrees from true vertical (positive = top leans right)
     if lines2 is not None:
         for line in lines2:
             x1, y1, x2, y2 = line[0]
-            dx, dy = float(x2 - x1), float(y2 - y1)
-            if abs(dy) > abs(dx) * 2.0 and abs(dy) > h // 8:
-                vert_lines.append((x1, y1, x2, y2))
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            # Only near-vertical lines: |dy| >> |dx|, long enough
+            if abs(dy) > abs(dx) * 3.0 and abs(dy) > h // 5:
+                # Angle from vertical in degrees
+                # Convention: if top of line is to the right of bottom → positive
+                # Ensure dy is always negative (top of line has smaller y)
+                if dy > 0:
+                    dx, dy = -dx, -dy
+                angle_deg = float(np.degrees(np.arctan2(dx, -dy)))
+                lean_angles.append(angle_deg)
 
-    if len(vert_lines) >= 4:
-        # Find vertical vanishing point via RANSAC-style pairwise intersections
-        vp_xs = []
-        import random
-        sample = vert_lines if len(vert_lines) <= 30 else random.sample(vert_lines, 30)
-        for i in range(len(sample)):
-            for j in range(i + 1, len(sample)):
-                x1,y1,x2,y2 = sample[i]
-                x3,y3,x4,y4 = sample[j]
-                # Line intersection
-                denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
-                if abs(denom) < 1e-6:
-                    continue
-                t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / denom
-                ix = x1 + t*(x2-x1)
-                iy = y1 + t*(y2-y1)
-                # Only consider intersections well above or below the frame
-                if iy < -h * 0.3 or iy > h * 1.3:
-                    vp_xs.append(ix)
+    if len(lean_angles) >= 4:
+        median_lean = float(np.median(lean_angles))
+        print(f"Vertical lean: median={median_lean:.2f}° from {len(lean_angles)} lines")
 
-        if len(vp_xs) >= 4:
-            vp_x = float(np.median(vp_xs))
-            # Horizontal offset of VP from image center = tilt direction
-            # For pure vertical convergence, VP should be at x=cx
-            # The y-VP location tells us how much verticals converge
-            # Estimate VP_y from lines
-            vp_ys = []
-            for i in range(len(sample)):
-                for j in range(i + 1, len(sample)):
-                    x1,y1,x2,y2 = sample[i]
-                    x3,y3,x4,y4 = sample[j]
-                    denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
-                    if abs(denom) < 1e-6:
-                        continue
-                    t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / denom
-                    iy = y1 + t*(y2-y1)
-                    if iy < -h * 0.1 or iy > h * 1.1:
-                        vp_ys.append(iy)
-
-            if vp_ys:
-                vp_y = float(np.median(vp_ys))
-                print(f"Vanishing point detected: ({vp_x:.0f}, {vp_y:.0f})")
-
-                # Only correct if VP is meaningfully above/below frame
-                if vp_y < h * 0.35 or vp_y > h * 0.65:
-                    # Stronger correction — multiply by 1.5 to fully straighten
-                    if vp_y < h * 0.5:  # converges upward (most common — camera tilted up)
-                        convergence = np.clip((h * 0.5 - vp_y) / (h * 1.2), 0, 0.30)
-                    else:  # converges downward
-                        convergence = np.clip((vp_y - h * 0.5) / (h * 1.2), 0, 0.30)
-
-                    shift = convergence * w
-                    if vp_y < h * 0.5:
-                        # Top converges: push top corners outward
-                        src = np.float32([[0,0],[w,0],[w,h],[0,h]])
-                        dst = np.float32([[-shift,0],[w+shift,0],[w,h],[0,h]])
-                    else:
-                        # Bottom converges: push bottom corners outward
-                        src = np.float32([[0,0],[w,0],[w,h],[0,h]])
-                        dst = np.float32([[0,0],[w,0],[w+shift,h],[-shift,h]])
-
-                    M = cv2.getPerspectiveTransform(src, dst)
-                    undistorted = cv2.warpPerspective(undistorted, M, (w, h),
-                                                     flags=cv2.INTER_LINEAR,
-                                                     borderMode=cv2.BORDER_REPLICATE)
-                    print(f"VP correction applied: convergence={convergence:.3f}, shift={shift:.1f}px")
+        # Only correct meaningful lean (> 0.3° and < 5° — avoid over-correction)
+        if 0.3 < abs(median_lean) < 5.0:
+            # Perspective warp: push top edge opposite to lean direction
+            # If median_lean > 0: top leans right → push top-left out, top-right in
+            # We map this as a horizontal shift of the top edge
+            shift = int(abs(median_lean) / 5.0 * w * 0.18)
+            if median_lean > 0:  # top leans right → correct left
+                src = np.float32([[0,0],[w,0],[w,h],[0,h]])
+                dst = np.float32([[-shift,0],[w+shift,0],[w,h],[0,h]])
+            else:  # top leans left → correct right
+                src = np.float32([[0,0],[w,0],[w,h],[0,h]])
+                dst = np.float32([[shift,0],[w-shift,0],[w,h],[0,h]])
+            M = cv2.getPerspectiveTransform(src, dst)
+            undistorted = cv2.warpPerspective(undistorted, M, (w, h),
+                                             flags=cv2.INTER_LINEAR,
+                                             borderMode=cv2.BORDER_REPLICATE)
+            print(f"Lean correction: {median_lean:.2f}° → shift={shift}px")
+        else:
+            print(f"Lean {median_lean:.2f}° within tolerance or too large — skipped")
+    else:
+        print(f"Not enough vertical lines ({len(lean_angles)}) — skipping lean correction")
 
     del gray, gray_eq, edges, gray2, gray2_eq, edges2, lines, lines2
     gc.collect()
