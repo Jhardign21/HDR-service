@@ -188,13 +188,14 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
             t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
             ix = x1 + t * (x2 - x1)
             iy = y1 + t * (y2 - y1)
-            # Only intersections clearly outside the image (genuine tilt, not natural perspective)
-            if (iy < -h * 0.5 or iy > h * 1.5) and (-w * 0.5 < ix < w * 1.5):
+            # Accept intersections outside the image bounds (genuine tilt)
+            # Use loose margin so slightly-above-frame VPs (moderate upward tilt) are included
+            if (iy < -h * 0.05 or iy > h * 1.05) and (-w * 0.3 < ix < w * 1.3):
                 vp_candidates.append((ix, iy))
 
     print(f"VP candidates: {len(vp_candidates)}")
 
-    if len(vp_candidates) < 10:
+    if len(vp_candidates) < 6:
         print("Not enough VP candidates — skipping correction")
         del gray, gray_eq, edges, lines
         gc.collect()
@@ -221,9 +222,9 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     # H_vp sends VP at (vpx-cx, vpy-cy) to infinity: row3 = [0, -1/(vpy-cy), 1]
     vpy_c = vpy - cy  # VP y in centered coords
 
-    # Cap correction: allow stronger correction for exterior shots with clear tilt
+    # Cap correction: allow full correction up to ~2x image height VP distance
     p = -1.0 / vpy_c
-    max_p = 1.0 / (0.4 * h)
+    max_p = 1.0 / (0.25 * h)
     p = float(np.clip(p, -max_p, max_p))
 
     # Full homography: T_back @ [[1,0,0],[0,1,0],[0,p,1]] @ T_to_origin
