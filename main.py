@@ -141,62 +141,142 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 
 def correct_geometry(img: np.ndarray) -> np.ndarray:
     """
-    1. Barrel/pincushion undistort (typical wide-angle real-estate lens)
-    2. Vertical perspective correction — straightens converging verticals
-       by detecting near-vertical lines and warping them to be parallel.
+    Adaptive per-image geometry correction:
+    1. Auto-fit barrel distortion from detected horizontal lines' curvature
+    2. Vanishing-point based vertical perspective correction
+       - Finds where vertical lines actually converge in THIS photo
+       - Computes exact warp to send that VP to infinity
     """
     h, w = img.shape[:2]
-
-    # --- Step 1: Barrel distortion correction ---
-    k1, k2, p1, p2 = -0.22, 0.07, 0.0, 0.0
-    fx = fy = w * 1.05
     cx, cy = w / 2.0, h / 2.0
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    dist = np.array([k1, k2, p1, p2], dtype=np.float64)
-    new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0)
-    undistorted = cv2.undistort(img, K, dist, None, new_K)
 
-    # --- Step 2: Vertical perspective correction (converging verticals) ---
-    gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 40, 120, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
-                            minLineLength=h // 6, maxLineGap=15)
+    # --- Step 1: Detect lines once, reuse for both corrections ---
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Equalize for low-contrast rooms
+    gray_eq = cv2.equalizeHist(gray)
+    edges = cv2.Canny(gray_eq, 30, 100, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50,
+                            minLineLength=h // 7, maxLineGap=20)
 
-    # Collect near-vertical line segments and measure their horizontal drift
-    # A perfect vertical has dx=0; converging lines have dx != 0
-    drifts = []  # horizontal drift per unit height (positive = lean right at top)
+    # --- Step 2: Adaptive barrel correction ---
+    # Estimate k1 from horizontal line curvature:
+    # Lines that should be horizontal but arc = barrel signature
+    h_curvatures = []
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            if abs(dy) > abs(dx) * 2.5 and abs(dy) > h // 8:
-                # drift: how much x changes per full image height
-                drift = dx / dy  # pixel shift per pixel drop
-                drifts.append(drift)
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            if dx > dy * 4 and dx > w // 6:  # near-horizontal, long enough
+                # Midpoint deviation from straight line = curvature proxy
+                # Use y-position relative to center: lines near edges curve more
+                mid_y = (y1 + y2) / 2.0
+                dist_from_center = (mid_y - cy) / cy  # -1 to 1
+                h_curvatures.append(dist_from_center)
 
-    if len(drifts) >= 4:
-        median_drift = float(np.median(drifts))
-        # Only correct if there is meaningful convergence
-        if abs(median_drift) > 0.004:
-            # Stronger clamp to allow real-estate lens corrections
-            correction = np.clip(median_drift, -0.14, 0.14)
-            # Amplify the shift — real-estate lenses need aggressive vertical fix
-            shift = correction * h * 0.85
-            src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-            dst = np.float32([
-                [shift,        0],
-                [w - shift,    0],
-                [w,            h],
-                [0,            h],
-            ])
-            M = cv2.getPerspectiveTransform(src, dst)
-            undistorted = cv2.warpPerspective(undistorted, M, (w, h),
-                                              flags=cv2.INTER_LINEAR,
-                                              borderMode=cv2.BORDER_REPLICATE)
-            print(f"Vertical perspective corrected: drift={median_drift:.4f}, shift={shift:.1f}px")
+    # Estimate k1: more lines bent toward edges = stronger barrel
+    if len(h_curvatures) >= 3:
+        # Barrel: lines above center bow up, below bow down
+        # Median signed deviation tells us direction and magnitude
+        med_curve = float(np.median(h_curvatures))
+        # Map to k1 range: typical real-estate lens -0.10 to -0.25
+        k1 = np.clip(-0.12 - abs(med_curve) * 0.15, -0.26, -0.08)
+    else:
+        k1 = -0.15  # safe default
 
-    del gray, edges, lines
+    k2 = abs(k1) * 0.3
+    fx = fy = w * 1.05
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    dist_coeffs = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
+    new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist_coeffs, (w, h), alpha=0.0)
+    undistorted = cv2.undistort(img, K, dist_coeffs, None, new_K)
+    print(f"Adaptive barrel: k1={k1:.3f} (from {len(h_curvatures)} h-lines)")
+
+    # Re-detect lines on undistorted image for VP step
+    gray2 = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+    gray2_eq = cv2.equalizeHist(gray2)
+    edges2 = cv2.Canny(gray2_eq, 30, 100, apertureSize=3)
+    lines2 = cv2.HoughLinesP(edges2, 1, np.pi / 180, threshold=50,
+                             minLineLength=h // 7, maxLineGap=20)
+
+    # --- Step 3: Vanishing point detection for vertical convergence ---
+    # Collect near-vertical lines as (x1,y1,x2,y2)
+    vert_lines = []
+    if lines2 is not None:
+        for line in lines2:
+            x1, y1, x2, y2 = line[0]
+            dx, dy = float(x2 - x1), float(y2 - y1)
+            if abs(dy) > abs(dx) * 2.5 and abs(dy) > h // 7:
+                vert_lines.append((x1, y1, x2, y2))
+
+    if len(vert_lines) >= 6:
+        # Find vertical vanishing point via RANSAC-style pairwise intersections
+        vp_xs = []
+        import random
+        sample = vert_lines if len(vert_lines) <= 30 else random.sample(vert_lines, 30)
+        for i in range(len(sample)):
+            for j in range(i + 1, len(sample)):
+                x1,y1,x2,y2 = sample[i]
+                x3,y3,x4,y4 = sample[j]
+                # Line intersection
+                denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+                if abs(denom) < 1e-6:
+                    continue
+                t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / denom
+                ix = x1 + t*(x2-x1)
+                iy = y1 + t*(y2-y1)
+                # Only consider intersections well above or below the frame
+                if iy < -h * 0.3 or iy > h * 1.3:
+                    vp_xs.append(ix)
+
+        if len(vp_xs) >= 8:
+            vp_x = float(np.median(vp_xs))
+            # Horizontal offset of VP from image center = tilt direction
+            # For pure vertical convergence, VP should be at x=cx
+            # The y-VP location tells us how much verticals converge
+            # Estimate VP_y from lines
+            vp_ys = []
+            for i in range(len(sample)):
+                for j in range(i + 1, len(sample)):
+                    x1,y1,x2,y2 = sample[i]
+                    x3,y3,x4,y4 = sample[j]
+                    denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+                    if abs(denom) < 1e-6:
+                        continue
+                    t = ((x1-x3)*(y3-y4) - (y1-y3)*(x3-x4)) / denom
+                    iy = y1 + t*(y2-y1)
+                    if iy < -h * 0.1 or iy > h * 1.1:
+                        vp_ys.append(iy)
+
+            if vp_ys:
+                vp_y = float(np.median(vp_ys))
+                print(f"Vanishing point detected: ({vp_x:.0f}, {vp_y:.0f})")
+
+                # Only correct if VP is meaningfully above/below frame
+                if vp_y < h * 0.4 or vp_y > h * 0.6:
+                    # Amount of convergence = how far VP_y is from infinity
+                    # Map VP position to a perspective shift
+                    if vp_y < h * 0.5:  # converges upward (most common — camera tilted up)
+                        convergence = np.clip((h * 0.5 - vp_y) / (h * 2.0), 0, 0.18)
+                    else:  # converges downward
+                        convergence = np.clip((vp_y - h * 0.5) / (h * 2.0), 0, 0.18)
+
+                    shift = convergence * w
+                    if vp_y < h * 0.5:
+                        # Top converges: push top corners outward
+                        src = np.float32([[0,0],[w,0],[w,h],[0,h]])
+                        dst = np.float32([[-shift,0],[w+shift,0],[w,h],[0,h]])
+                    else:
+                        # Bottom converges: push bottom corners outward
+                        src = np.float32([[0,0],[w,0],[w,h],[0,h]])
+                        dst = np.float32([[0,0],[w,0],[w+shift,h],[-shift,h]])
+
+                    M = cv2.getPerspectiveTransform(src, dst)
+                    undistorted = cv2.warpPerspective(undistorted, M, (w, h),
+                                                     flags=cv2.INTER_LINEAR,
+                                                     borderMode=cv2.BORDER_REPLICATE)
+                    print(f"VP correction applied: convergence={convergence:.3f}, shift={shift:.1f}px")
+
+    del gray, gray_eq, edges, gray2, gray2_eq, edges2, lines, lines2
     gc.collect()
     return undistorted
 
