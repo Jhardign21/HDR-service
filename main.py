@@ -203,10 +203,10 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
         for line in lines2:
             x1, y1, x2, y2 = line[0]
             dx, dy = float(x2 - x1), float(y2 - y1)
-            if abs(dy) > abs(dx) * 2.5 and abs(dy) > h // 7:
+            if abs(dy) > abs(dx) * 2.0 and abs(dy) > h // 8:
                 vert_lines.append((x1, y1, x2, y2))
 
-    if len(vert_lines) >= 6:
+    if len(vert_lines) >= 4:
         # Find vertical vanishing point via RANSAC-style pairwise intersections
         vp_xs = []
         import random
@@ -226,7 +226,7 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
                 if iy < -h * 0.3 or iy > h * 1.3:
                     vp_xs.append(ix)
 
-        if len(vp_xs) >= 8:
+        if len(vp_xs) >= 4:
             vp_x = float(np.median(vp_xs))
             # Horizontal offset of VP from image center = tilt direction
             # For pure vertical convergence, VP should be at x=cx
@@ -250,13 +250,12 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
                 print(f"Vanishing point detected: ({vp_x:.0f}, {vp_y:.0f})")
 
                 # Only correct if VP is meaningfully above/below frame
-                if vp_y < h * 0.4 or vp_y > h * 0.6:
-                    # Amount of convergence = how far VP_y is from infinity
-                    # Map VP position to a perspective shift
+                if vp_y < h * 0.35 or vp_y > h * 0.65:
+                    # Stronger correction — multiply by 1.5 to fully straighten
                     if vp_y < h * 0.5:  # converges upward (most common — camera tilted up)
-                        convergence = np.clip((h * 0.5 - vp_y) / (h * 2.0), 0, 0.18)
+                        convergence = np.clip((h * 0.5 - vp_y) / (h * 1.2), 0, 0.30)
                     else:  # converges downward
-                        convergence = np.clip((vp_y - h * 0.5) / (h * 2.0), 0, 0.18)
+                        convergence = np.clip((vp_y - h * 0.5) / (h * 1.2), 0, 0.30)
 
                     shift = convergence * w
                     if vp_y < h * 0.5:
@@ -527,7 +526,7 @@ async def merge_hdr(req: MergeRequest):
         gc.collect()
 
         # Grab dark image BEFORE alignment — raw underexposed frame for window pull
-        dark_img = get_darkest_image(images)
+        dark_img = get_darkest_image(images).copy()
 
         if len(images) > 1:
             images = align_images(images)
@@ -538,8 +537,11 @@ async def merge_hdr(req: MergeRequest):
             gc.collect()
 
         # Geometry correction — undistort + straighten verticals
-        print("Correcting geometry...")
+        print("Correcting geometry on merged...")
         merged = correct_geometry(merged)
+        # Apply same geometry correction to dark image so window pull aligns
+        print("Correcting geometry on dark bracket...")
+        dark_img = correct_geometry(dark_img)
 
         # Auto-analyse image if no params supplied
         if p is None:
