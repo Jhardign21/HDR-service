@@ -142,45 +142,59 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 def correct_geometry(img: np.ndarray) -> np.ndarray:
     """
     1. Barrel/pincushion undistort (typical wide-angle real-estate lens)
-    2. Vertical perspective correction via detected vertical lines
+    2. Vertical perspective correction — straightens converging verticals
+       by detecting near-vertical lines and warping them to be parallel.
     """
     h, w = img.shape[:2]
 
     # --- Step 1: Barrel distortion correction ---
-    # k1 negative = barrel (wide-angle). Tuned for typical 16-24mm equiv lenses.
-    k1, k2, p1, p2 = -0.15, 0.05, 0.0, 0.0
-    fx = fy = w * 1.1  # approximate focal length
+    k1, k2, p1, p2 = -0.18, 0.06, 0.0, 0.0
+    fx = fy = w * 1.05
     cx, cy = w / 2.0, h / 2.0
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
     dist = np.array([k1, k2, p1, p2], dtype=np.float64)
     new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0)
     undistorted = cv2.undistort(img, K, dist, None, new_K)
 
-    # --- Step 2: Vertical keystone correction ---
-    # Detect strong near-vertical lines; compute average tilt of walls
+    # --- Step 2: Vertical perspective correction (converging verticals) ---
     gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=h // 5, maxLineGap=20)
+    edges = cv2.Canny(gray, 40, 120, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                            minLineLength=h // 6, maxLineGap=15)
 
-    angles = []
+    # Collect near-vertical line segments and measure their horizontal drift
+    # A perfect vertical has dx=0; converging lines have dx != 0
+    drifts = []  # horizontal drift per unit height (positive = lean right at top)
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            dx, dy = x2 - x1, y2 - y1
-            if abs(dy) > abs(dx) * 2:  # near-vertical lines only
-                angle = np.degrees(np.arctan2(dx, dy))  # deviation from vertical
-                angles.append(angle)
+            dx = float(x2 - x1)
+            dy = float(y2 - y1)
+            if abs(dy) > abs(dx) * 2.5 and abs(dy) > h // 8:
+                # drift: how much x changes per full image height
+                drift = dx / dy  # pixel shift per pixel drop
+                drifts.append(drift)
 
-    if angles:
-        # Median tilt — ignore outliers
-        tilt = float(np.median(angles))
-        # Only correct if tilt is meaningful but not extreme (camera was just tilted a bit)
-        if 0.3 < abs(tilt) < 5.0:
-            M = cv2.getRotationMatrix2D((w / 2, h / 2), tilt, 1.0)
-            undistorted = cv2.warpAffine(undistorted, M, (w, h),
-                                         flags=cv2.INTER_LINEAR,
-                                         borderMode=cv2.BORDER_REPLICATE)
+    if len(drifts) >= 4:
+        median_drift = float(np.median(drifts))
+        # Only correct if there is meaningful convergence
+        if abs(median_drift) > 0.005:
+            # Clamp correction to avoid over-warp
+            correction = np.clip(median_drift, -0.08, 0.08)
+            # Build a perspective transform that shifts top edge opposite to drift
+            shift = correction * h * 0.5
+            src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+            dst = np.float32([
+                [shift,        0],
+                [w - shift,    0],
+                [w,            h],
+                [0,            h],
+            ])
+            M = cv2.getPerspectiveTransform(src, dst)
+            undistorted = cv2.warpPerspective(undistorted, M, (w, h),
+                                              flags=cv2.INTER_LINEAR,
+                                              borderMode=cv2.BORDER_REPLICATE)
+            print(f"Vertical perspective corrected: drift={median_drift:.4f}, shift={shift:.1f}px")
 
     del gray, edges, lines
     gc.collect()
