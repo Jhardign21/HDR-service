@@ -234,7 +234,6 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     T_inv = np.array([[1,0,cx],[0,1,cy],[0,0,1]], dtype=np.float64)
     H_full = T_inv @ H @ T
 
-    # Warp with black border so we can detect and crop the valid region
     result = cv2.warpPerspective(
         img, H_full, (w, h),
         flags=cv2.INTER_LINEAR,
@@ -243,29 +242,31 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     )
     print(f"VP correction applied: p={p:.6f} vpy_c={vpy_c:.0f}")
 
-    # --- Auto-crop: find largest valid rectangle and resize back to original dims ---
-    # For this homography (only row 3 changes), the valid region is symmetric horizontally.
-    # Top rows and bottom rows may be clipped. Find the tightest valid crop.
-    gray_result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-    # Find rows/cols that are entirely non-black
-    row_has_content = np.any(gray_result > 2, axis=1)   # True where row has real pixels
-    col_has_content = np.any(gray_result > 2, axis=0)
-    valid_rows = np.where(row_has_content)[0]
-    valid_cols = np.where(col_has_content)[0]
-    if len(valid_rows) > 10 and len(valid_cols) > 10:
-        r0, r1 = int(valid_rows[0]), int(valid_rows[-1])
-        c0, c1 = int(valid_cols[0]), int(valid_cols[-1])
-        # Add a small inset (2px) to avoid edge artifacts
-        r0 = min(r0 + 2, h - 1)
-        r1 = max(r1 - 2, 0)
-        c0 = min(c0 + 2, w - 1)
-        c1 = max(c1 - 2, 0)
-        if r1 > r0 + 50 and c1 > c0 + 50:
-            cropped = result[r0:r1, c0:c1]
-            result = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            print(f"Cropped valid region: rows [{r0}:{r1}] cols [{c0}:{c1}], resized to {w}x{h}")
+    # --- Analytical crop: project the 4 source corners through H_full ---
+    # This finds the exact inscribed valid rectangle with no black corners.
+    corners_src = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float64).T
+    corners_dst = H_full @ corners_src
+    corners_dst /= corners_dst[2, :]  # normalize homogeneous
+    dst_x = corners_dst[0, :]
+    dst_y = corners_dst[1, :]
+
+    # Valid inscribed rectangle: tightest box where ALL corners are inside
+    x0 = int(np.ceil(max(dst_x[0], dst_x[3])))   # left edge: max of left-side corners
+    x1 = int(np.floor(min(dst_x[1], dst_x[2])))  # right edge: min of right-side corners
+    y0 = int(np.ceil(max(dst_y[0], dst_y[1])))   # top edge: max of top corners
+    y1 = int(np.floor(min(dst_y[2], dst_y[3])))  # bottom edge: min of bottom corners
+
+    # Clamp to image bounds with small safety margin
+    x0 = max(x0 + 2, 0)
+    x1 = min(x1 - 2, w)
+    y0 = max(y0 + 2, 0)
+    y1 = min(y1 - 2, h)
+
+    print(f"Analytical crop: x=[{x0}:{x1}] y=[{y0}:{y1}]")
+    if x1 > x0 + 100 and y1 > y0 + 100:
+        cropped = result[y0:y1, x0:x1]
+        result = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
         del cropped
-    del gray_result
 
     del gray, gray_eq, edges, lines
     gc.collect()
