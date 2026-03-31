@@ -141,108 +141,109 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 
 def correct_geometry(img: np.ndarray) -> np.ndarray:
     """
-    Adaptive per-image geometry correction:
-    1. Auto-fit barrel distortion from detected horizontal lines' curvature
-    2. Vanishing-point based vertical perspective correction
-       - Finds where vertical lines actually converge in THIS photo
-       - Computes exact warp to send that VP to infinity
+    Lightroom Upright-style vertical perspective correction:
+    1. Detect near-vertical lines via Hough
+    2. Find vertical vanishing point via robust pairwise intersections
+    3. Apply centered homography H that sends VP to infinity
+       (correctly anchored at principal point cx,cy)
+    No barrel correction — it creates edge artifacts on real-estate wide-angle shots.
     """
     h, w = img.shape[:2]
     cx, cy = w / 2.0, h / 2.0
 
-    # --- Step 1: Detect lines once, reuse for both corrections ---
+    # --- Detect near-vertical lines ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Equalize for low-contrast rooms
     gray_eq = cv2.equalizeHist(gray)
     edges = cv2.Canny(gray_eq, 30, 100, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50,
-                            minLineLength=h // 7, maxLineGap=20)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                            minLineLength=h // 5, maxLineGap=15)
 
-    # --- Step 2: Adaptive barrel correction ---
-    # Estimate k1 from horizontal line curvature:
-    # Lines that should be horizontal but arc = barrel signature
-    h_curvatures = []
+    vert_lines = []
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            dx, dy = abs(x2 - x1), abs(y2 - y1)
-            if dx > dy * 4 and dx > w // 6:  # near-horizontal, long enough
-                # Midpoint deviation from straight line = curvature proxy
-                # Use y-position relative to center: lines near edges curve more
-                mid_y = (y1 + y2) / 2.0
-                dist_from_center = (mid_y - cy) / cy  # -1 to 1
-                h_curvatures.append(dist_from_center)
+            dx, dy = float(x2 - x1), float(y2 - y1)
+            if abs(dy) > abs(dx) * 2.5 and abs(dy) > h // 5:
+                vert_lines.append((float(x1), float(y1), float(x2), float(y2)))
 
-    # Estimate k1: more lines bent toward edges = stronger barrel
-    if len(h_curvatures) >= 3:
-        med_curve = float(np.median(h_curvatures))
-        # Conservative range — avoid over-correcting real-estate wide-angle lenses
-        k1 = np.clip(-0.06 - abs(med_curve) * 0.08, -0.14, -0.03)
-    else:
-        k1 = -0.07  # conservative safe default
+    print(f"Vertical lines: {len(vert_lines)}")
 
-    k2 = abs(k1) * 0.3
-    fx = fy = w * 1.05
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    dist_coeffs = np.array([k1, k2, 0.0, 0.0], dtype=np.float64)
-    new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist_coeffs, (w, h), alpha=0.0)
-    undistorted = cv2.undistort(img, K, dist_coeffs, None, new_K)
-    print(f"Adaptive barrel: k1={k1:.3f} (from {len(h_curvatures)} h-lines)")
+    if len(vert_lines) < 6:
+        print("Not enough vertical lines — skipping VP correction")
+        del gray, gray_eq, edges, lines
+        gc.collect()
+        return img
 
-    # --- Step 3: Measure average lean of vertical lines directly ---
-    # More reliable than VP intersection: compute each near-vertical line's
-    # angle from true vertical, take the median, apply exact perspective shear.
-    gray2 = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-    gray2_eq = cv2.equalizeHist(gray2)
-    edges2 = cv2.Canny(gray2_eq, 30, 100, apertureSize=3)
-    lines2 = cv2.HoughLinesP(edges2, 1, np.pi / 180, threshold=60,
-                             minLineLength=h // 6, maxLineGap=15)
+    # --- Find vertical VP via pairwise intersections ---
+    import random
+    sample = vert_lines if len(vert_lines) <= 40 else random.sample(vert_lines, 40)
+    vp_candidates = []
+    for i in range(len(sample)):
+        for j in range(i + 1, len(sample)):
+            x1, y1, x2, y2 = sample[i]
+            x3, y3, x4, y4 = sample[j]
+            denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+            if abs(denom) < 1e-6:
+                continue
+            t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+            ix = x1 + t * (x2 - x1)
+            iy = y1 + t * (y2 - y1)
+            # Only intersections clearly outside the image (genuine tilt, not natural perspective)
+            if (iy < -h * 0.5 or iy > h * 1.5) and (-w * 0.5 < ix < w * 1.5):
+                vp_candidates.append((ix, iy))
 
-    lean_angles = []  # degrees from true vertical (positive = top leans right)
-    if lines2 is not None:
-        for line in lines2:
-            x1, y1, x2, y2 = line[0]
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            # Only near-vertical lines: |dy| >> |dx|, long enough
-            if abs(dy) > abs(dx) * 3.0 and abs(dy) > h // 5:
-                # Angle from vertical in degrees
-                # Convention: if top of line is to the right of bottom → positive
-                # Ensure dy is always negative (top of line has smaller y)
-                if dy > 0:
-                    dx, dy = -dx, -dy
-                angle_deg = float(np.degrees(np.arctan2(dx, -dy)))
-                lean_angles.append(angle_deg)
+    print(f"VP candidates: {len(vp_candidates)}")
 
-    if len(lean_angles) >= 4:
-        median_lean = float(np.median(lean_angles))
-        print(f"Vertical lean: median={median_lean:.2f}° from {len(lean_angles)} lines")
+    if len(vp_candidates) < 10:
+        print("Not enough VP candidates — skipping correction")
+        del gray, gray_eq, edges, lines
+        gc.collect()
+        return img
 
-        # Only correct meaningful lean (> 0.3° and < 5° — avoid over-correction)
-        if 0.3 < abs(median_lean) < 5.0:
-            # Perspective warp: push top edge opposite to lean direction
-            # If median_lean > 0: top leans right → push top-left out, top-right in
-            # We map this as a horizontal shift of the top edge
-            shift = int(abs(median_lean) / 5.0 * w * 0.18)
-            if median_lean > 0:  # top leans right → correct left
-                src = np.float32([[0,0],[w,0],[w,h],[0,h]])
-                dst = np.float32([[-shift,0],[w+shift,0],[w,h],[0,h]])
-            else:  # top leans left → correct right
-                src = np.float32([[0,0],[w,0],[w,h],[0,h]])
-                dst = np.float32([[shift,0],[w-shift,0],[w,h],[0,h]])
-            M = cv2.getPerspectiveTransform(src, dst)
-            undistorted = cv2.warpPerspective(undistorted, M, (w, h),
-                                             flags=cv2.INTER_LINEAR,
-                                             borderMode=cv2.BORDER_REPLICATE)
-            print(f"Lean correction: {median_lean:.2f}° → shift={shift}px")
-        else:
-            print(f"Lean {median_lean:.2f}° within tolerance or too large — skipped")
-    else:
-        print(f"Not enough vertical lines ({len(lean_angles)}) — skipping lean correction")
+    vpy = float(np.median([v[1] for v in vp_candidates]))
+    vpx = float(np.median([v[0] for v in vp_candidates]))
+    print(f"VP: ({vpx:.0f}, {vpy:.0f}) image={w}x{h} center=({cx:.0f},{cy:.0f})")
 
-    del gray, gray_eq, edges, gray2, gray2_eq, edges2, lines, lines2
+    # VP must be genuinely outside (real tilt) not just natural in-frame convergence
+    if -h * 0.8 <= vpy <= h * 1.8:
+        print(f"VP y={vpy:.0f} too close to image — natural perspective, skipping")
+        del gray, gray_eq, edges, lines
+        gc.collect()
+        return img
+
+    # --- Centered Lightroom-style homography ---
+    # Translate so principal point is at origin, apply keystone, translate back.
+    # This matches how Lightroom/ACR compute Upright corrections.
+    # H_centered = T_back @ H_vp @ T_to_origin
+    # H_vp sends VP at (vpx-cx, vpy-cy) to infinity: row3 = [0, -1/(vpy-cy), 1]
+    vpy_c = vpy - cy  # VP y in centered coords
+
+    # Cap correction: don't over-warp
+    p = -1.0 / vpy_c
+    max_p = 1.0 / (0.6 * h)
+    p = float(np.clip(p, -max_p, max_p))
+
+    # Full homography: T_back @ [[1,0,0],[0,1,0],[0,p,1]] @ T_to_origin
+    H = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0,   p, 1.0]
+    ], dtype=np.float64)
+    # Account for translation: T_back @ H @ T_to_origin
+    T = np.array([[1,0,-cx],[0,1,-cy],[0,0,1]], dtype=np.float64)
+    T_inv = np.array([[1,0,cx],[0,1,cy],[0,0,1]], dtype=np.float64)
+    H_full = T_inv @ H @ T
+
+    result = cv2.warpPerspective(
+        img, H_full, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+    print(f"VP correction applied: p={p:.6f} vpy_c={vpy_c:.0f}")
+
+    del gray, gray_eq, edges, lines
     gc.collect()
-    return undistorted
+    return result
 
 
 # ---------------------------------------------------------------------------
