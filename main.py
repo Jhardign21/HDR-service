@@ -32,26 +32,12 @@ OUTPUT_HEIGHT = 1536
 # ---------------------------------------------------------------------------
 
 class ProcessingParams(BaseModel):
-    # White balance
-    temperature: float = 0.0     # -50 to +50 K shift
-    tint: float = 0.0            # -50 to +50 green/magenta
-    # Tone (Lightroom -100..+100 scale)
-    exposure: float = 0.18
-    contrast: float = 0.0
-    highlights: float = 0.0
-    shadows: float = 28.0
-    whites: float = 92.0
-    blacks: float = 2.0
-    # Presence
-    texture: float = 0.0
-    clarity: float = 0.0
-    dehaze: float = 0.0
-    vibrance: float = 0.0
-    saturation: float = 0.0      # -100..+100 (0 = no change)
-    # Detail
-    sharpening: float = 30.0     # 0..150
-    noise_reduction: float = 0.0 # 0..100
-    # Window
+    exposure: float = 0.18       # modest lift — prevents ceiling blow-out
+    saturation: float = 1.0
+    shadows: float = 0.28        # lift dark corners without bleaching
+    whites: float = 0.92
+    blacks: float = 0.02
+    temperature: float = 0.0
     window_pull: float = 0.55
 
 
@@ -297,43 +283,62 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
 
 def analyze_image(img: np.ndarray) -> ProcessingParams:
     """
-    Analyze the merged (pre-tone) image and return adaptive ProcessingParams.
+    Analyze the merged (pre-tone) image and return adaptive ProcessingParams
+    tuned to this specific photo, targeting the professional real-estate look:
+    bright whites, clean neutrals, lifted shadows, natural contrast.
     """
     f = img.astype(np.float32) / 255.0
-    lum = 0.2126 * f[:,:,2] + 0.7152 * f[:,:,1] + 0.0722 * f[:,:,0]
+    # Work in luminance
+    lum = 0.2126 * f[:,:,2] + 0.7152 * f[:,:,1] + 0.0722 * f[:,:,0]  # RGB weights
 
-    mean_lum = float(np.mean(lum))
-    p5  = float(np.percentile(lum, 5))
-    p99 = float(np.percentile(lum, 99))
+    mean_lum   = float(np.mean(lum))
+    p5         = float(np.percentile(lum, 5))    # deep shadows
+    p25        = float(np.percentile(lum, 25))   # midtone-dark
+    p75        = float(np.percentile(lum, 75))   # midtone-bright
+    p95        = float(np.percentile(lum, 95))   # near-highlights
+    p99        = float(np.percentile(lum, 99))   # highlight ceiling
 
-    # Exposure: target bright airy look (mean ~0.62)
+    # --- Exposure: target bright airy real-estate look (mean ~0.62) ---
     target_mean = 0.62
-    raw_ev = np.log2(target_mean / mean_lum) if mean_lum > 0.01 else 1.0
+    if mean_lum > 0.01:
+        raw_ev = np.log2(target_mean / mean_lum)
+    else:
+        raw_ev = 1.0
+    # Less dampening so we actually reach the target brightness
     exposure = float(np.clip(raw_ev * 0.78, -0.3, 0.85))
 
-    # Shadows (LR scale 0..100)
+    # --- Shadow lift: raise p5 toward ~0.12 (bright clean shadows) ---
     shadow_gap = max(0.0, 0.12 - p5)
-    shadows = float(np.clip(shadow_gap * 250, 14, 55))
+    shadows = float(np.clip(shadow_gap * 2.5, 0.14, 0.55))
 
-    # Whites (LR scale -100..+100; positive = brighter ceiling)
-    whites = float(np.clip((1.0 - p99) * 40 - 8, -20, 15))
+    # --- Whites ceiling: keep high — real estate needs bright whites ---
+    if p99 > 0.93:
+        whites = float(np.clip(0.90 + (1.0 - p99) * 0.4, 0.86, 0.97))
+    else:
+        whites = 0.97
 
-    # Blacks (LR scale -100..+100)
-    blacks = float(np.clip(p5 * 10, 0, 5))
+    # --- Blacks: minimal lift for clean look ---
+    blacks = float(np.clip(p5 * 0.10, 0.003, 0.02))
 
+    # Saturation: fixed neutral — real estate wants accurate colors
+    saturation = 1.0
+
+    # Window pull: more pull if image has strong blown regions
     blown_frac = float(np.mean(lum > 0.92))
     window_pull = float(np.clip(0.40 + blown_frac * 1.5, 0.40, 0.65))
 
     params = ProcessingParams(
         exposure=exposure,
+        saturation=saturation,
         shadows=shadows,
         whites=whites,
         blacks=blacks,
+        temperature=temperature,
         window_pull=window_pull,
     )
-    print(f"Adaptive params: exp={exposure:.2f} shad={shadows:.0f} whites={whites:.0f} "
-          f"blacks={blacks:.1f} wp={window_pull:.2f} "
-          f"[mean={mean_lum:.2f} p5={p5:.2f} p99={p99:.2f}]")
+    print(f"Adaptive params: exp={exposure:.2f} shad={shadows:.2f} whites={whites:.2f} "
+          f"blacks={blacks:.3f} temp={temperature:.0f} wp={window_pull:.2f} "
+          f"[mean={mean_lum:.2f} p5={p5:.2f} p95={p95:.2f} p99={p99:.2f}]")
     return params
 
 
@@ -344,120 +349,60 @@ def analyze_image(img: np.ndarray) -> ProcessingParams:
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = img.astype(np.float32) / 255.0
 
-    # 1. Gentle gamma lift
+    # 1. Gentle gamma lift (0.95 — softer, preserves highlight texture)
     f = np.power(np.clip(f, 1e-6, 1.0), 0.95)
 
     # 2. Exposure
     ev = 2.0 ** p.exposure
     f = np.clip(f * ev, 0, 1)
 
-    # 3. Highlights recovery (LR -100..+100 mapped to 0..1 pull)
-    if p.highlights != 0:
-        hl_strength = p.highlights / 100.0
-        hi_mask = np.clip((f - 0.5) / 0.5, 0, 1)
-        if hl_strength < 0:  # recover / pull down highlights
-            f = f + hi_mask * hl_strength * (f - 0.5)
-        else:  # boost highlights
-            f = f + hi_mask * hl_strength * (1.0 - f) * 0.5
-        f = np.clip(f, 0, 1)
+    # 3. Shadow lift
+    shadow_mask = np.clip(1.0 - f / 0.30, 0, 1)
+    f = np.clip(f + shadow_mask * p.shadows, 0, 1)
 
-    # 4. Shadows lift/pull (LR -100..+100)
-    shadow_lr = p.shadows / 100.0   # -1..+1
-    if shadow_lr > 0:
-        shadow_mask = np.clip(1.0 - f / 0.35, 0, 1)
-        f = np.clip(f + shadow_mask * shadow_lr * 0.55, 0, 1)
-    elif shadow_lr < 0:
-        shadow_mask = np.clip(1.0 - f / 0.35, 0, 1)
-        f = np.clip(f + shadow_mask * shadow_lr * 0.4, 0, 1)
+    # 4. Black floor
+    f = f * (1.0 - p.blacks) + p.blacks
 
-    # 5. Whites ceiling (LR -100..+100 → remap)
-    whites_lr = p.whites / 100.0  # -1..+1; default 0.92 → use as ceiling
-    # Positive = allow brighter whites, negative = compress whites
-    whites_ceiling = np.clip(0.92 + whites_lr * 0.08, 0.70, 1.0)
-    f = np.clip(f, 0, whites_ceiling) / whites_ceiling
+    # 5. White ceiling
+    f = np.clip(f, 0, p.whites) / p.whites
 
-    # 6. Blacks floor (LR -100..+100)
-    blacks_lr = p.blacks / 100.0
-    if blacks_lr > 0:
-        f = f * (1.0 - blacks_lr * 0.06) + blacks_lr * 0.06
-    elif blacks_lr < 0:
-        f = np.power(np.clip(f, 1e-6, 1.0), 1.0 + abs(blacks_lr) * 0.5)
+    # 6. Highlight rolloff — compress highlights above 75% to protect ceiling texture
+    hi = np.clip((f - 0.75) / 0.25, 0, 1)
+    f = f - hi * (f - 0.75) * 0.55
     f = np.clip(f, 0, 1)
 
-    # 7. Contrast (S-curve strength)
-    contrast_strength = p.contrast / 100.0  # -1..+1
-    s_curve = f * f * (3.0 - 2.0 * f)  # base S
-    f = np.clip(f + (s_curve - f) * (0.4 + contrast_strength * 0.6), 0, 1)
+    # 7. Mild S-curve
+    f = f * f * (3.0 - 2.0 * f)
 
-    # 8. Temperature & Tint shift
+    # 8. Optional temperature shift (user-controlled, off by default)
     lum = (f[:, :, 0] + f[:, :, 1] + f[:, :, 2]) / 3.0
+    mid_mask = np.clip((0.75 - lum) / 0.25, 0, 1)
+    mid_mask3 = np.stack([mid_mask] * 3, axis=2)
+
     if abs(p.temperature) > 0.5:
         shift = p.temperature / 500.0
-        f[:, :, 2] = np.clip(f[:, :, 2] + shift, 0, 1)        # R warm
-        f[:, :, 1] = np.clip(f[:, :, 1] + shift * 0.15, 0, 1)
-        f[:, :, 0] = np.clip(f[:, :, 0] - shift * 0.55, 0, 1) # B cool
-    if abs(p.tint) > 0.5:
-        tshift = p.tint / 500.0
-        f[:, :, 1] = np.clip(f[:, :, 1] + tshift, 0, 1)       # G axis
-        f[:, :, 2] = np.clip(f[:, :, 2] - tshift * 0.3, 0, 1)
+        delta = np.zeros_like(f)
+        delta[:, :, 2] += shift
+        delta[:, :, 1] += shift * 0.2
+        delta[:, :, 0] -= shift * 0.6
+        f = np.clip(f + delta * mid_mask3, 0, 1)
 
-    # 9. Clarity (local contrast via unsharp mask on midtones)
-    if abs(p.clarity) > 1:
-        clarity_f = p.clarity / 100.0
-        rgb_u8_c = np.clip(f * 255, 0, 255).astype(np.uint8)
-        blurred_c = cv2.GaussianBlur(rgb_u8_c, (0, 0), sigmaX=10)
-        high_freq = rgb_u8_c.astype(np.float32) - blurred_c.astype(np.float32)
-        mid_mask = np.clip(4.0 * lum * (1.0 - lum), 0, 1)
-        mid_mask3 = np.stack([mid_mask] * 3, axis=2)
-        f = np.clip(f + high_freq / 255.0 * clarity_f * 0.7 * mid_mask3, 0, 1)
-        del rgb_u8_c, blurred_c, high_freq, mid_mask3
+    # 9. NO gray-world WB — removed: it fights warm-toned rooms (cream/peach walls,
+    # honey wood floors) and produces blue casts. Camera WB is preserved from rawpy.
 
-    # 10. Texture (fine detail sharpening)
-    if abs(p.texture) > 1:
-        texture_f = p.texture / 100.0
-        rgb_u8_t = np.clip(f * 255, 0, 255).astype(np.uint8)
-        blurred_t = cv2.GaussianBlur(rgb_u8_t, (0, 0), sigmaX=2)
-        f = np.clip(f + (rgb_u8_t.astype(np.float32) - blurred_t.astype(np.float32)) / 255.0 * texture_f * 0.5, 0, 1)
-        del rgb_u8_t, blurred_t
+    del lum, mid_mask, mid_mask3
 
-    # 11. Dehaze (increase local contrast + saturation in hazy regions)
-    if abs(p.dehaze) > 1:
-        dehaze_f = p.dehaze / 100.0
-        # Boost contrast and darken shadows slightly
-        f = np.clip(f - dehaze_f * 0.08 * (1.0 - f), 0, 1)  # darken
-        f = np.clip(f * (1.0 + dehaze_f * 0.15), 0, 1)       # contrast
-
-    del lum
-    gc.collect()
-
-    # 12. Saturation + Vibrance (HSV)
+    # 10. Saturation
     rgb_u8 = np.clip(f * 255, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat_mult = 1.0 + p.saturation / 100.0
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_mult, 0, 255)
-    if abs(p.vibrance) > 0.5:
-        # Vibrance: boost less-saturated pixels more
-        vib_f = p.vibrance / 100.0
-        norm_sat = hsv[:, :, 1] / 255.0
-        vib_mask = 1.0 - norm_sat  # more effect on unsaturated
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + vib_f * vib_mask * 0.8), 0, 255)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * p.saturation, 0, 255)
     result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    del hsv
 
-    # 13. Sharpening (0..150, 30 = gentle default)
-    if p.sharpening > 0:
-        sharp_radius = 1.0 + p.sharpening / 150.0 * 1.5
-        sharp_amount = 0.5 + p.sharpening / 150.0 * 1.5
-        blurred_s = cv2.GaussianBlur(result, (0, 0), sigmaX=sharp_radius)
-        result = cv2.addWeighted(result, 1.0 + sharp_amount, blurred_s, -sharp_amount, 0)
-        del blurred_s
+    # 11. Gentle sharpening
+    blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=1.2)
+    result = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
 
-    # 14. Noise reduction
-    if p.noise_reduction > 0:
-        nr_h = int(p.noise_reduction / 10) + 1
-        result = cv2.fastNlMeansDenoisingColored(result, None, nr_h, nr_h, 7, 21)
-
-    del f, rgb_u8
+    del f, hsv, blurred
     gc.collect()
     return result
 
