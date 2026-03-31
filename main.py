@@ -175,13 +175,11 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
 
     # Estimate k1: more lines bent toward edges = stronger barrel
     if len(h_curvatures) >= 3:
-        # Barrel: lines above center bow up, below bow down
-        # Median signed deviation tells us direction and magnitude
         med_curve = float(np.median(h_curvatures))
-        # Map to k1 range: typical real-estate lens -0.10 to -0.25
-        k1 = np.clip(-0.12 - abs(med_curve) * 0.15, -0.26, -0.08)
+        # Conservative range — avoid over-correcting real-estate wide-angle lenses
+        k1 = np.clip(-0.06 - abs(med_curve) * 0.08, -0.14, -0.03)
     else:
-        k1 = -0.15  # safe default
+        k1 = -0.07  # conservative safe default
 
     k2 = abs(k1) * 0.3
     fx = fy = w * 1.05
@@ -282,6 +280,71 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Per-image adaptive tone analysis
+# ---------------------------------------------------------------------------
+
+def analyze_image(img: np.ndarray) -> ProcessingParams:
+    """
+    Analyze the merged (pre-tone) image and return adaptive ProcessingParams
+    tuned to this specific photo, targeting the professional real-estate look:
+    bright whites, clean neutrals, lifted shadows, natural contrast.
+    """
+    f = img.astype(np.float32) / 255.0
+    # Work in luminance
+    lum = 0.2126 * f[:,:,2] + 0.7152 * f[:,:,1] + 0.0722 * f[:,:,0]  # RGB weights
+
+    mean_lum   = float(np.mean(lum))
+    p5         = float(np.percentile(lum, 5))    # deep shadows
+    p25        = float(np.percentile(lum, 25))   # midtone-dark
+    p75        = float(np.percentile(lum, 75))   # midtone-bright
+    p95        = float(np.percentile(lum, 95))   # near-highlights
+    p99        = float(np.percentile(lum, 99))   # highlight ceiling
+
+    # --- Exposure: target bright airy real-estate look (mean ~0.62) ---
+    target_mean = 0.62
+    if mean_lum > 0.01:
+        raw_ev = np.log2(target_mean / mean_lum)
+    else:
+        raw_ev = 1.0
+    # Less dampening so we actually reach the target brightness
+    exposure = float(np.clip(raw_ev * 0.78, -0.3, 0.85))
+
+    # --- Shadow lift: raise p5 toward ~0.12 (bright clean shadows) ---
+    shadow_gap = max(0.0, 0.12 - p5)
+    shadows = float(np.clip(shadow_gap * 2.5, 0.14, 0.55))
+
+    # --- Whites ceiling: keep high — real estate needs bright whites ---
+    if p99 > 0.93:
+        whites = float(np.clip(0.90 + (1.0 - p99) * 0.4, 0.86, 0.97))
+    else:
+        whites = 0.97
+
+    # --- Blacks: minimal lift for clean look ---
+    blacks = float(np.clip(p5 * 0.10, 0.003, 0.02))
+
+    # Saturation: fixed neutral — real estate wants accurate colors
+    saturation = 1.0
+
+    # Window pull: more pull if image has strong blown regions
+    blown_frac = float(np.mean(lum > 0.92))
+    window_pull = float(np.clip(0.40 + blown_frac * 1.5, 0.40, 0.65))
+
+    params = ProcessingParams(
+        exposure=exposure,
+        saturation=saturation,
+        shadows=shadows,
+        whites=whites,
+        blacks=blacks,
+        temperature=temperature,
+        window_pull=window_pull,
+    )
+    print(f"Adaptive params: exp={exposure:.2f} shad={shadows:.2f} whites={whites:.2f} "
+          f"blacks={blacks:.3f} temp={temperature:.0f} wp={window_pull:.2f} "
+          f"[mean={mean_lum:.2f} p5={p5:.2f} p95={p95:.2f} p99={p99:.2f}]")
+    return params
+
+
+# ---------------------------------------------------------------------------
 # Tone pipeline
 # ---------------------------------------------------------------------------
 
@@ -305,9 +368,9 @@ def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     # 5. White ceiling
     f = np.clip(f, 0, p.whites) / p.whites
 
-    # 6. Highlight rolloff — compress highlights above 60% to protect ceiling texture
-    hi = np.clip((f - 0.60) / 0.40, 0, 1)
-    f = f - hi * (f - 0.60) * 0.70
+    # 6. Highlight rolloff — compress highlights above 75% to protect ceiling texture
+    hi = np.clip((f - 0.75) / 0.25, 0, 1)
+    f = f - hi * (f - 0.75) * 0.55
     f = np.clip(f, 0, 1)
 
     # 7. Mild S-curve
@@ -444,8 +507,14 @@ async def merge_hdr(req: MergeRequest):
     if len(req.file_urls) not in (1, 3, 5):
         raise HTTPException(400, f"Expected 1, 3, or 5 files, got {len(req.file_urls)}")
 
-    p = req.params or ProcessingParams()
-    print(f"Processing params: {p}")
+    # Use caller-supplied params if provided, otherwise analyse this image
+    if req.params is not None:
+        p = req.params
+        print(f"Using supplied params: {p}")
+    else:
+        # Will be computed after merge, before tone mapping
+        p = None
+    print(f"Auto-analyse mode: {p is None}")
 
     tmp_paths = []
     try:
@@ -471,6 +540,11 @@ async def merge_hdr(req: MergeRequest):
         # Geometry correction — undistort + straighten verticals
         print("Correcting geometry...")
         merged = correct_geometry(merged)
+
+        # Auto-analyse image if no params supplied
+        if p is None:
+            print("Analysing image for adaptive tone params...")
+            p = analyze_image(merged)
 
         # Detect windows on merged (blown windows clearly visible here)
         window_mask = None
