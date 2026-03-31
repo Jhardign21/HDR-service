@@ -204,9 +204,12 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     vpx = float(np.median([v[0] for v in vp_candidates]))
     print(f"VP: ({vpx:.0f}, {vpy:.0f}) image={w}x{h} center=({cx:.0f},{cy:.0f})")
 
-    # VP must be genuinely outside (real tilt) not just natural in-frame convergence
-    if -h * 0.4 <= vpy <= h * 1.4:
-        print(f"VP y={vpy:.0f} too close to image — natural perspective, skipping")
+    # VP must be outside the image. Skip only if VP is clearly inside image bounds.
+    # For upward-tilted exterior shots, VP is above image (vpy < 0) — must NOT skip those.
+    # For downward-tilted shots, VP is below image (vpy > h) — also valid.
+    # Only skip if VP is between 10% and 90% of image height (clearly inside = just natural perspective).
+    if h * 0.10 <= vpy <= h * 0.90:
+        print(f"VP y={vpy:.0f} inside image — natural perspective, skipping")
         del gray, gray_eq, edges, lines
         gc.collect()
         return img
