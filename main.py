@@ -205,7 +205,7 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     print(f"VP: ({vpx:.0f}, {vpy:.0f}) image={w}x{h} center=({cx:.0f},{cy:.0f})")
 
     # VP must be genuinely outside (real tilt) not just natural in-frame convergence
-    if -h * 0.8 <= vpy <= h * 1.8:
+    if -h * 0.4 <= vpy <= h * 1.4:
         print(f"VP y={vpy:.0f} too close to image — natural perspective, skipping")
         del gray, gray_eq, edges, lines
         gc.collect()
@@ -218,9 +218,9 @@ def correct_geometry(img: np.ndarray) -> np.ndarray:
     # H_vp sends VP at (vpx-cx, vpy-cy) to infinity: row3 = [0, -1/(vpy-cy), 1]
     vpy_c = vpy - cy  # VP y in centered coords
 
-    # Cap correction: don't over-warp
+    # Cap correction: allow stronger correction for exterior shots with clear tilt
     p = -1.0 / vpy_c
-    max_p = 1.0 / (0.6 * h)
+    max_p = 1.0 / (0.4 * h)
     p = float(np.clip(p, -max_p, max_p))
 
     # Full homography: T_back @ [[1,0,0],[0,1,0],[0,p,1]] @ T_to_origin
