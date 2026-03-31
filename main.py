@@ -136,6 +136,58 @@ def apply_window_pull(merged: np.ndarray, dark_img: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Geometry correction — lens undistort + vertical keystone
+# ---------------------------------------------------------------------------
+
+def correct_geometry(img: np.ndarray) -> np.ndarray:
+    """
+    1. Barrel/pincushion undistort (typical wide-angle real-estate lens)
+    2. Vertical perspective correction via detected vertical lines
+    """
+    h, w = img.shape[:2]
+
+    # --- Step 1: Barrel distortion correction ---
+    # k1 negative = barrel (wide-angle). Tuned for typical 16-24mm equiv lenses.
+    k1, k2, p1, p2 = -0.15, 0.05, 0.0, 0.0
+    fx = fy = w * 1.1  # approximate focal length
+    cx, cy = w / 2.0, h / 2.0
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    dist = np.array([k1, k2, p1, p2], dtype=np.float64)
+    new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0.0)
+    undistorted = cv2.undistort(img, K, dist, None, new_K)
+
+    # --- Step 2: Vertical keystone correction ---
+    # Detect strong near-vertical lines; compute average tilt of walls
+    gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=h // 5, maxLineGap=20)
+
+    angles = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx, dy = x2 - x1, y2 - y1
+            if abs(dy) > abs(dx) * 2:  # near-vertical lines only
+                angle = np.degrees(np.arctan2(dx, dy))  # deviation from vertical
+                angles.append(angle)
+
+    if angles:
+        # Median tilt — ignore outliers
+        tilt = float(np.median(angles))
+        # Only correct if tilt is meaningful but not extreme (camera was just tilted a bit)
+        if 0.3 < abs(tilt) < 5.0:
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), tilt, 1.0)
+            undistorted = cv2.warpAffine(undistorted, M, (w, h),
+                                         flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_REPLICATE)
+
+    del gray, edges, lines
+    gc.collect()
+    return undistorted
+
+
+# ---------------------------------------------------------------------------
 # Tone pipeline
 # ---------------------------------------------------------------------------
 
@@ -321,6 +373,10 @@ async def merge_hdr(req: MergeRequest):
         if len(images) > 1:
             del images
             gc.collect()
+
+        # Geometry correction — undistort + straighten verticals
+        print("Correcting geometry...")
+        merged = correct_geometry(merged)
 
         # Detect windows on merged (blown windows clearly visible here)
         window_mask = None
