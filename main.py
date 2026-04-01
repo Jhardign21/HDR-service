@@ -520,7 +520,7 @@ def imagine_generative_fill(img: np.ndarray, mask: np.ndarray, prompt: str, api_
 
     try:
         response = requests.post(
-            'https://api.vyro.ai/v2/image/edits/generative-fill',
+            'https://api.vyro.ai/v2/image/edits/inpaint',
             headers={'Authorization': f'Bearer {api_key}'},
             files={
                 'image': ('image.jpg', img_bytes, 'image/jpeg'),
@@ -724,5 +724,4 @@ async def merge_hdr(req: MergeRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
     return {"status": "ok"}
