@@ -520,7 +520,7 @@ def imagine_generative_fill(img: np.ndarray, mask: np.ndarray, prompt: str, api_
 
     try:
         response = requests.post(
-            'https://api.vyro.ai/v2/image/edits/inpaint',
+            'https://api.vyro.ai/v2/image/edits/generative-fill',
             headers={'Authorization': f'Bearer {api_key}'},
             files={
                 'image': ('image.jpg', img_bytes, 'image/jpeg'),
