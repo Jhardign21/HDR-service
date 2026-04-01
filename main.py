@@ -415,6 +415,8 @@ class MergeRequest(BaseModel):
     file_urls: List[str]
     bracket_name: str = "bracket"
     params: Optional[ProcessingParams] = None
+    imagine_api_key: Optional[str] = None
+    replace_sky: bool = True
 
 
 def download_file(url: str, suffix: str) -> str:
@@ -495,6 +497,98 @@ def get_darkest_image(images: List[np.ndarray]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Imagine Art Generative Fill — inpainting via API
+# ---------------------------------------------------------------------------
+
+def imagine_generative_fill(img: np.ndarray, mask: np.ndarray, prompt: str, api_key: str) -> np.ndarray:
+    """
+    Call Imagine Art Generative Fill API.
+    img: BGR uint8
+    mask: float32 0-1 (1 = fill this area)
+    Returns BGR uint8 result, or original img on failure.
+    """
+    # Encode image as JPEG bytes
+    _, img_buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    img_bytes = img_buf.tobytes()
+
+    # Encode mask as PNG (white=fill, black=keep)
+    mask_u8 = (np.clip(mask, 0, 1) * 255).astype(np.uint8)
+    # Expand to 3-channel for imencode
+    mask_bgr = cv2.merge([mask_u8, mask_u8, mask_u8])
+    _, mask_buf = cv2.imencode('.png', mask_bgr)
+    mask_bytes = mask_buf.tobytes()
+
+    try:
+        response = requests.post(
+            'https://api.vyro.ai/v2/image/edits/generative-fill',
+            headers={'Authorization': f'Bearer {api_key}'},
+            files={
+                'image': ('image.jpg', img_bytes, 'image/jpeg'),
+                'mask': ('mask.png', mask_bytes, 'image/png'),
+            },
+            data={'prompt': prompt},
+            timeout=120,
+        )
+        if response.status_code == 200:
+            result_arr = np.frombuffer(response.content, np.uint8)
+            result_img = cv2.imdecode(result_arr, cv2.IMREAD_COLOR)
+            if result_img is not None:
+                # Resize to match original dimensions
+                result_img = cv2.resize(result_img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+                print(f'Imagine fill success: {prompt[:50]}')
+                return result_img
+            else:
+                print('Imagine fill: could not decode response image')
+        else:
+            print(f'Imagine fill error {response.status_code}: {response.text[:200]}')
+    except Exception as e:
+        print(f'Imagine fill exception: {e}')
+
+    return img
+
+
+def detect_sky_mask(img: np.ndarray) -> np.ndarray:
+    """
+    Detect overexposed sky region — top portion of image with blown/very bright pixels.
+    Returns float32 mask 0-1.
+    """
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0]
+
+    # Blown = very bright
+    blown = (L > 210).astype(np.uint8) * 255
+
+    # Restrict to top 45% of image (sky zone)
+    sky_zone = np.zeros_like(blown)
+    sky_zone[:int(h * 0.45), :] = blown[:int(h * 0.45), :]
+
+    # Close gaps, remove noise
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+    sky_zone = cv2.morphologyEx(sky_zone, cv2.MORPH_CLOSE, close_k)
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    sky_zone = cv2.morphologyEx(sky_zone, cv2.MORPH_OPEN, open_k)
+
+    # Keep only large blobs
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_zone, connectivity=8)
+    min_area = (w * h) * 0.02
+    filtered = np.zeros_like(sky_zone)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            filtered[labels == i] = 255
+
+    # Feather
+    feathered = cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), sigmaX=10)
+    max_val = feathered.max()
+    if max_val > 0:
+        feathered = feathered / max_val
+
+    del lab, L, blown, sky_zone, filtered
+    gc.collect()
+    return feathered
+
+
+# ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
@@ -564,10 +658,33 @@ async def merge_hdr(req: MergeRequest):
         gc.collect()
 
         # Apply window pull AFTER tone mapping
-        # Use raw dark_img (not tone-mapped) with slight lift — preserves natural exterior look
         if window_mask is not None and p.window_pull > 0:
-            print(f"Applying window pull (strength={p.window_pull})...")
-            toned = apply_window_pull(toned, dark_img, window_mask, strength=p.window_pull)
+            if req.imagine_api_key:
+                print('Applying window pull via Imagine Art...')
+                toned = imagine_generative_fill(
+                    toned, window_mask,
+                    'bright exterior view through window, blue sky outside, natural daylight, professional real estate photography',
+                    req.imagine_api_key
+                )
+            else:
+                print(f'Applying window pull (strength={p.window_pull})...')
+                toned = apply_window_pull(toned, dark_img, window_mask, strength=p.window_pull)
+
+        # Sky replacement via Imagine Art
+        if req.imagine_api_key and req.replace_sky:
+            print('Detecting sky for replacement...')
+            sky_mask = detect_sky_mask(toned)
+            sky_coverage = float(np.mean(sky_mask))
+            print(f'Sky mask coverage: {sky_coverage:.4f}')
+            if sky_coverage > 0.005:
+                print('Replacing sky via Imagine Art...')
+                toned = imagine_generative_fill(
+                    toned, sky_mask,
+                    'beautiful blue sky with white clouds, golden hour light, professional real estate exterior photography',
+                    req.imagine_api_key
+                )
+            else:
+                print('No significant sky region detected — skipping sky replacement')
 
         del dark_img
         gc.collect()
@@ -607,4 +724,5 @@ async def merge_hdr(req: MergeRequest):
 
 @app.get("/health")
 def health():
+    return {"status": "ok"}
     return {"status": "ok"}
