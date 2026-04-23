@@ -298,30 +298,30 @@ def analyze_image(img: np.ndarray) -> ProcessingParams:
     p95        = float(np.percentile(lum, 95))   # near-highlights
     p99        = float(np.percentile(lum, 99))   # highlight ceiling
 
-    # --- Exposure: target bright airy real-estate look (mean ~0.62) ---
-    target_mean = 0.62
+    # --- Exposure: target very bright, crisp exterior look (mean ~0.72) ---
+    target_mean = 0.72
     if mean_lum > 0.01:
         raw_ev = np.log2(target_mean / mean_lum)
     else:
         raw_ev = 1.0
-    # Less dampening so we actually reach the target brightness
-    exposure = float(np.clip(raw_ev * 0.78, -0.3, 0.85))
+    # Full multiplier — no dampening
+    exposure = float(np.clip(raw_ev * 0.95, 0.0, 1.2))
 
-    # --- Shadow lift: raise p5 toward ~0.12 (bright clean shadows) ---
-    shadow_gap = max(0.0, 0.12 - p5)
-    shadows = float(np.clip(shadow_gap * 2.5, 0.14, 0.55))
+    # --- Shadow lift: raise p5 toward ~0.16 (bright, clean, crisp) ---
+    shadow_gap = max(0.0, 0.16 - p5)
+    shadows = float(np.clip(shadow_gap * 3.5, 0.25, 0.60))
 
-    # --- Whites ceiling: keep high — real estate needs bright whites ---
-    if p99 > 0.93:
-        whites = float(np.clip(0.90 + (1.0 - p99) * 0.4, 0.86, 0.97))
-    else:
-        whites = 0.97
+    # --- Whites: no artificial ceiling — let highlights stay natural ---
+    whites = 1.0
 
-    # --- Blacks: minimal lift for clean look ---
-    blacks = float(np.clip(p5 * 0.10, 0.003, 0.02))
+    # --- Blacks: very minimal --- 
+    blacks = float(np.clip(p5 * 0.05, 0.001, 0.010))
 
-    # Saturation: fixed neutral — real estate wants accurate colors
-    saturation = 1.0
+    # Saturation: strong boost for vibrant, punchy look
+    saturation = 1.45
+
+    # Temperature: off by default
+    temperature = 0.0
 
     # Window pull: more pull if image has strong blown regions
     blown_frac = float(np.mean(lum > 0.92))
@@ -349,30 +349,33 @@ def analyze_image(img: np.ndarray) -> ProcessingParams:
 def apply_tone(img: np.ndarray, p: ProcessingParams) -> np.ndarray:
     f = img.astype(np.float32) / 255.0
 
-    # 1. Gentle gamma lift (0.95 — softer, preserves highlight texture)
-    f = np.power(np.clip(f, 1e-6, 1.0), 0.95)
+    # 1. Mild gamma (0.96 — preserve highlight detail while brightening)
+    f = np.power(np.clip(f, 1e-6, 1.0), 0.96)
 
-    # 2. Exposure
+    # 2. Aggressive exposure (push brightness)
     ev = 2.0 ** p.exposure
     f = np.clip(f * ev, 0, 1)
 
-    # 3. Shadow lift
+    # 3. Shadow lift — keep aggressive
     shadow_mask = np.clip(1.0 - f / 0.30, 0, 1)
     f = np.clip(f + shadow_mask * p.shadows, 0, 1)
 
-    # 4. Black floor
+    # 4. Black floor — minimal
     f = f * (1.0 - p.blacks) + p.blacks
 
-    # 5. White ceiling
-    f = np.clip(f, 0, p.whites) / p.whites
-
-    # 6. Highlight rolloff — compress highlights above 75% to protect ceiling texture
-    hi = np.clip((f - 0.75) / 0.25, 0, 1)
-    f = f - hi * (f - 0.75) * 0.55
+    # 5. Tone curve: NO white ceiling crush — let brights breathe
+    # Instead use a smooth rolloff that preserves highlight detail
     f = np.clip(f, 0, 1)
+    # Gentle compression only in extreme highlights (above 0.85)
+    extreme_hi = np.clip((f - 0.85) / 0.15, 0, 1)
+    f = f - extreme_hi * (f - 0.85) * 0.15
 
-    # 7. Mild S-curve
-    f = f * f * (3.0 - 2.0 * f)
+    # 6. Strong S-curve for Lightroom-style contrast and pop
+    # Apply twice for more pronounced effect
+    f = np.clip(f, 0, 1)
+    s_curve = f * f * (3.0 - 2.0 * f)  # First S-curve
+    s_curve = s_curve * s_curve * (3.0 - 2.0 * s_curve)  # Second S-curve (stronger)
+    f = np.clip(s_curve * 1.08, 0, 1)
 
     # 8. Optional temperature shift (user-controlled, off by default)
     lum = (f[:, :, 0] + f[:, :, 1] + f[:, :, 2]) / 3.0
