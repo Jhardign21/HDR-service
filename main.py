@@ -76,12 +76,12 @@ def load_image_bgr(path: str) -> np.ndarray:
 def build_window_mask(dark_frame: np.ndarray, sigma: float = 10.0) -> np.ndarray:
     """
     Build a soft window mask from the DARKEST bracket frame.
-    Any pixel STILL bright in the underexposed shot = window glass / sky.
+    Only pixels EXTREMELY bright in the underexposed shot are true windows.
     Returns float32 mask [0..1], shape H×W×1 for broadcasting.
     """
     lum = cv2.cvtColor(dark_frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    WIN_THRESH = 0.52  # pixels brighter than this in the dark frame are windows
-    mask = np.clip((lum - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 1.2
+    WIN_THRESH = 0.72  # raised — only true window glass, not bright walls/ceiling
+    mask = np.clip((lum - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 2.0  # sharper falloff
     mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
     return np.clip(mask, 0, 1)[:, :, np.newaxis]
 
@@ -145,17 +145,18 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         gc.collect()
 
         # ── 6. Window composite ────────────────────────────────────────────────
-        # Mertens can still render glass bright & washed — pull the window pixels
-        # from the dark frame (which has detail in the glass) back over the result.
+        # For true window pixels (extremely bright in dark frame): blend in a
+        # brightened version of the dark frame to recover foliage/sky detail
+        # without making the windows look dark and murky.
         if len(images) > 1:
             print("Compositing window detail from dark frame...")
-            win_mask = build_window_mask(dark_frame, sigma=12.0)  # H×W×1
+            win_mask = build_window_mask(dark_frame, sigma=8.0)  # H×W×1
 
-            # Slightly brighten the dark frame's window area so it doesn't look dim
-            dark_f   = dark_frame.astype(np.float32) / 255.0
-            # Lift only the window pixels gently
-            dark_f   = np.clip(dark_f * 1.25, 0, 1)
-            dark_u8  = (dark_f * 255).astype(np.uint8)
+            # Brighten the dark frame window area significantly so it shows foliage
+            # at a natural exposure (like the target image)
+            dark_f  = dark_frame.astype(np.float32) / 255.0
+            dark_f  = np.clip(dark_f * 1.8, 0, 1)  # lift dark frame toward normal exposure
+            dark_u8 = (dark_f * 255).astype(np.uint8)
 
             merged_f = merged.astype(np.float32)
             dark_win = dark_u8.astype(np.float32)
@@ -204,24 +205,24 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA            = 0.72   # much gentler lift — Mertens output is already bright
-    HI_START_RAW     = 0.82   # only touch near-white highlights
-    HI_CAP           = 0.88   # pull blown areas back to this
-    HI_STRENGTH      = 0.70   # strong pull to tame blown ceiling/walls
-    FILL_CUTOFF      = 0.30   # only lift true shadows (dark cabinets, floor)
-    FILL_STRENGTH    = 0.20   # subtle fill — don't lift midtones
-    WHITES_START     = 0.85   # whites push only on near-white surfaces
-    WHITES_STRENGTH  = 0.30   # gentle — ceiling is already bright enough
-    R_MULT           = 1.02   # very subtle warm
-    G_MULT           = 1.00
-    B_MULT           = 0.99
-    VIBRANCE         = 18.0
-    SHARPEN_AMT      = 0.45
+    GAMMA            = 0.85   # very gentle — preserve Mertens tones
+    HI_START_RAW     = 0.88   # only pull back very blown highlights
+    HI_CAP           = 0.93   # allow bright ceiling/walls — they should be white
+    HI_STRENGTH      = 0.40   # gentle — ceiling should stay bright white
+    FILL_CUTOFF      = 0.40   # lift shadows up to midtone level (floor tiles need detail)
+    FILL_STRENGTH    = 0.35   # moderate fill to reveal dark tile detail
+    WHITES_START     = 0.80   # push whites on ceiling and walls
+    WHITES_STRENGTH  = 0.45   # moderate — ceiling should be clean white
+    R_MULT           = 1.06   # warm up reds — wood cabinets need warmth
+    G_MULT           = 1.01
+    B_MULT           = 0.96   # reduce blue cast
+    VIBRANCE         = 22.0
+    SHARPEN_AMT      = 0.50
     SHARPEN_RADIUS   = 1.0
 
     # ── 1. WINDOW PROTECTION MASK ─────────────────────────────────────────────
     lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    WIN_THRESH = 0.80
+    WIN_THRESH = 0.92  # only protect extreme window blowout, not ceiling/walls
     win_protect = np.clip((lum_raw - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 0.8
     win_protect_blurred = cv2.GaussianBlur(win_protect, (0, 0), sigmaX=5, sigmaY=5)
     win_protect_blurred = np.clip(win_protect_blurred, 0, 1)
