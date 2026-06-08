@@ -73,70 +73,30 @@ def load_image_bgr(path: str) -> np.ndarray:
 # Core HDR pipeline: AlignMTB → Debevec → window composite → Reinhard tonemap
 # ---------------------------------------------------------------------------
 
-def estimate_exposure_times(n: int) -> List[float]:
-    """
-    Estimate plausible exposure times for a bracket of n images.
-    Assumes standard 2-stop spacing (1/125, 1/30, 1/8 for a 3-shot bracket).
-    Order: darkest → brightest.
-    """
-    if n == 1:
-        return [0.033]
-    if n == 3:
-        return [1/125.0, 1/30.0, 1/8.0]
-    if n == 5:
-        return [1/500.0, 1/125.0, 1/30.0, 1/8.0, 0.5]
-    # Generic: 2-stop spacing centred on 1/30s
-    base = 1.0 / 30.0
-    stops = [base * (4.0 ** (i - n // 2)) for i in range(n)]
-    return stops
-
-
-def build_window_mask(dark_frame: np.ndarray, sigma: float = 8.0) -> np.ndarray:
+def build_window_mask(dark_frame: np.ndarray, sigma: float = 10.0) -> np.ndarray:
     """
     Build a soft window mask from the DARKEST bracket frame.
-
-    In the underexposed shot the interior is black but windows retain detail —
-    any pixel that is STILL bright in the dark frame must be a window (sky/glass).
-    Returns float32 mask [0..1], broadcast-ready as H×W×1.
+    Any pixel STILL bright in the underexposed shot = window glass / sky.
+    Returns float32 mask [0..1], shape H×W×1 for broadcasting.
     """
     lum = cv2.cvtColor(dark_frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-    # Threshold: pixels brighter than 0.55 in the dark frame are window glass
-    WIN_THRESH = 0.55
+    WIN_THRESH = 0.52  # pixels brighter than this in the dark frame are windows
     mask = np.clip((lum - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 1.2
-    # Feather edges so window frames blend naturally
     mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    mask = np.clip(mask, 0, 1)
-    return mask[:, :, np.newaxis]  # H×W×1
-
-
-def tonemap_reinhard(hdr: np.ndarray) -> np.ndarray:
-    """
-    Apply OpenCV Reinhard global tonemap to a float32 HDR image (0..very large).
-    Returns uint8 BGR [0..255].
-    """
-    tonemap = cv2.createTonemapReinhard(
-        gamma=1.5,       # slight gamma lift — interiors need brightness
-        intensity=0.0,   # exposure adjustment (0 = auto)
-        light_adapt=0.8, # local adaption strength
-        color_adapt=0.0, # keep colours neutral
-    )
-    ldr = tonemap.process(hdr)   # returns float32 [0..1] approximately
-    ldr = np.clip(ldr, 0, 1)
-    return (ldr * 255).astype(np.uint8)
+    return np.clip(mask, 0, 1)[:, :, np.newaxis]
 
 
 def bracket_merge(file_urls: List[str]) -> np.ndarray:
     """
-    Professional HDR merge pipeline:
+    Professional HDR merge pipeline (no Debevec — Mertens is more robust):
       1. Download & decode all bracket frames
       2. Resize all to OUTPUT dimensions
       3. AlignMTB — correct camera shake between shots
-      4. Sort frames dark→bright (by mean luminance)
-      5. MergeDebevec → true HDR float image
-      6. TonemapReinhard → 8-bit LDR base
-      7. Window composite: blend dark-frame windows OVER merged result
-         so window glass keeps its detail rather than being blown
-      8. Feed into apply_autohdr_finish() for the final look
+      4. Sort frames dark→bright by mean luminance
+      5. MergeMertens exposure fusion → clean 8-bit LDR base
+         (Mertens needs no exposure times and handles RAW perfectly)
+      6. Window composite: pull dark-frame window pixels BACK over the fusion
+         result so glass/sky retains detail instead of being blown or grey
     """
     tmp_paths = []
     try:
@@ -148,81 +108,65 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
             tmp_paths.append(download_file(url, ext))
 
         # ── 2. Decode & resize ─────────────────────────────────────────────────
-        images_raw = []
+        images = []
         for p in tmp_paths:
             img = load_image_bgr(p)
             img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-            images_raw.append(img)
-        print(f"Loaded {len(images_raw)} frames at {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")
+            images.append(img)
+        print(f"Loaded {len(images)} frames at {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")
         gc.collect()
 
         # ── 3. AlignMTB ────────────────────────────────────────────────────────
-        print("Aligning frames with AlignMTB...")
-        align = cv2.createAlignMTB(max_bits=6, exclude_range=4, cut=True)
-        images_aligned = list(images_raw)  # copy list; align.process modifies in-place
-        align.process(images_aligned, images_aligned)
-        del images_raw
-        gc.collect()
+        if len(images) > 1:
+            print("Aligning frames with AlignMTB...")
+            align = cv2.createAlignMTB(max_bits=6, exclude_range=4, cut=True)
+            align.process(images, images)
+            gc.collect()
 
         # ── 4. Sort dark → bright ──────────────────────────────────────────────
-        means = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in images_aligned]
-        order = np.argsort(means)
-        images_sorted = [images_aligned[i] for i in order]
-        print(f"Frame order (dark→bright) means: {[round(means[i], 1) for i in order]}")
+        means = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in images]
+        order = list(np.argsort(means))
+        images = [images[i] for i in order]
+        print(f"Frame means dark→bright: {[round(means[i], 1) for i in order]}")
+        dark_frame = images[0]   # underexposed — best window detail
 
-        dark_frame  = images_sorted[0]   # underexposed — best window detail
-        bright_frame = images_sorted[-1]  # overexposed  — best interior detail
-
-        # ── 5. Exposure times & MergeDebevec ──────────────────────────────────
-        times = np.array(estimate_exposure_times(len(images_sorted)), dtype=np.float32)
-        print(f"Using estimated exposure times: {times}")
-
-        calibrate = cv2.createCalibrateDebevec(samples=70, lambda_=10.0)
-        response  = calibrate.process(images_sorted, times)
-
-        merge = cv2.createMergeDebevec()
-        hdr   = merge.process(images_sorted, times, response)
-        print(f"HDR float image range: {hdr.min():.4f} – {hdr.max():.4f}")
-        del images_sorted
+        # ── 5. Mertens exposure fusion ─────────────────────────────────────────
+        if len(images) > 1:
+            print("Fusing with Mertens...")
+            fused = cv2.createMergeMertens(
+                contrast_weight=1.2,
+                saturation_weight=1.0,
+                exposure_weight=0.4,
+            ).process(images)
+            merged = np.clip(fused * 255, 0, 255).astype(np.uint8)
+            del fused
+        else:
+            merged = images[0].copy()
         gc.collect()
 
-        # ── 6. Reinhard tonemap ────────────────────────────────────────────────
-        print("Tonemapping with Reinhard...")
-        merged_ldr = tonemap_reinhard(hdr)
-        del hdr
-        gc.collect()
+        # ── 6. Window composite ────────────────────────────────────────────────
+        # Mertens can still render glass bright & washed — pull the window pixels
+        # from the dark frame (which has detail in the glass) back over the result.
+        if len(images) > 1:
+            print("Compositing window detail from dark frame...")
+            win_mask = build_window_mask(dark_frame, sigma=12.0)  # H×W×1
 
-        # ── 7. Window composite ────────────────────────────────────────────────
-        # The tonemapped result may still have blown/grey windows because Debevec
-        # averages across all frames. We composite the dark frame's window pixels
-        # back in — they have the best glass/sky detail.
-        #
-        # Strategy:
-        #   window_mask  = bright pixels in dark_frame  (these are real windows)
-        #   result = merged_ldr * (1 - mask) + dark_frame_tonemap * mask
-        #
-        # We tone-map the dark frame separately with a brighter setting so the
-        # window glass looks naturally lit rather than underexposed.
-        print("Building window mask from dark frame...")
-        win_mask = build_window_mask(dark_frame, sigma=10.0)  # H×W×1, float32
+            # Slightly brighten the dark frame's window area so it doesn't look dim
+            dark_f   = dark_frame.astype(np.float32) / 255.0
+            # Lift only the window pixels gently
+            dark_f   = np.clip(dark_f * 1.25, 0, 1)
+            dark_u8  = (dark_f * 255).astype(np.uint8)
 
-        # Tone-map the dark frame to expose its window detail properly
-        dark_float = dark_frame.astype(np.float32) / 255.0
-        # Gentle Reinhard on the dark frame — only the window region matters
-        tonemap_dark = cv2.createTonemapReinhard(gamma=1.2, intensity=1.5, light_adapt=0.6, color_adapt=0.0)
-        dark_ldr = tonemap_dark.process(dark_float)
-        dark_ldr = np.clip(dark_ldr * 255, 0, 255).astype(np.uint8)
-        del dark_float
+            merged_f = merged.astype(np.float32)
+            dark_win = dark_u8.astype(np.float32)
+            composited = merged_f * (1.0 - win_mask) + dark_win * win_mask
+            composited = np.clip(composited, 0, 255).astype(np.uint8)
+            del merged_f, dark_win, win_mask, dark_f, dark_u8
+            gc.collect()
+        else:
+            composited = merged
 
-        # Composite: windows from dark_ldr, interior from merged_ldr
-        merged_f  = merged_ldr.astype(np.float32)
-        dark_f    = dark_ldr.astype(np.float32)
-        composited = merged_f * (1.0 - win_mask) + dark_f * win_mask
-        composited = np.clip(composited, 0, 255).astype(np.uint8)
-        del merged_ldr, dark_ldr, merged_f, dark_f, win_mask
-        gc.collect()
-
-        print("Bracket merge complete — handing off to AutoHDR finish.")
+        print("Bracket merge complete.")
         return composited
 
     finally:
