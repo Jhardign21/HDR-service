@@ -45,7 +45,6 @@ def photomatix_merge(file_urls: List[str], api_key: str) -> np.ndarray:
             "alignment": "yes",
             "deghosting": "on",
             "noise-reduction": "underexposed",
-            "lens-correction": "yes",
             "output-bit-depth": "8",
         },
         timeout=30,
