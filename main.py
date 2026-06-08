@@ -134,9 +134,9 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         if len(images) > 1:
             print("Fusing with Mertens...")
             fused = cv2.createMergeMertens(
-                contrast_weight=1.2,
-                saturation_weight=1.0,
-                exposure_weight=0.4,
+                contrast_weight=1.4,
+                saturation_weight=0.8,
+                exposure_weight=0.0,  # 0 = purely contrast/saturation driven, no exposure bias
             ).process(images)
             merged = np.clip(fused * 255, 0, 255).astype(np.uint8)
             del fused
@@ -204,18 +204,18 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA            = 0.42
-    HI_START_RAW     = 0.80   # raised vs old 0.72 — window detail already handled
-    HI_CAP           = 0.92   # softer cap — just prevent clipping
-    HI_STRENGTH      = 0.50
-    FILL_CUTOFF      = 0.45
-    FILL_STRENGTH    = 0.38
-    WHITES_START     = 0.78
-    WHITES_STRENGTH  = 0.72
-    R_MULT           = 1.04
-    G_MULT           = 1.02
-    B_MULT           = 0.98
-    VIBRANCE         = 22.0
+    GAMMA            = 0.72   # much gentler lift — Mertens output is already bright
+    HI_START_RAW     = 0.82   # only touch near-white highlights
+    HI_CAP           = 0.88   # pull blown areas back to this
+    HI_STRENGTH      = 0.70   # strong pull to tame blown ceiling/walls
+    FILL_CUTOFF      = 0.30   # only lift true shadows (dark cabinets, floor)
+    FILL_STRENGTH    = 0.20   # subtle fill — don't lift midtones
+    WHITES_START     = 0.85   # whites push only on near-white surfaces
+    WHITES_STRENGTH  = 0.30   # gentle — ceiling is already bright enough
+    R_MULT           = 1.02   # very subtle warm
+    G_MULT           = 1.00
+    B_MULT           = 0.99
+    VIBRANCE         = 18.0
     SHARPEN_AMT      = 0.45
     SHARPEN_RADIUS   = 1.0
 
@@ -229,9 +229,7 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     interior3    = 1.0 - win_protect3
 
     # ── 2. PRE-LIFT ───────────────────────────────────────────────────────────
-    c = 0.08
-    img = img / (img + c) * (1.0 + c)
-    img = np.clip(img, 0, 1)
+    # Gentle gamma only — no Reinhard curve on top of Mertens (already tone-mapped)
     img = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
     img = np.clip(img, 0, 1)
 
@@ -258,8 +256,8 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img = np.clip(img, 0, 1)
 
     # ── 6. GLOBAL BRIGHTNESS BOOST (interior only) ────────────────────────────
-    img = img + 0.18 * (1.0 - img) * interior3
-    img = np.clip(img, 0, 1)
+    # Disabled — Mertens output doesn't need a global push, it's already exposed well
+    # img = img + 0.18 * (1.0 - img) * interior3
 
     # ── 7. COLOUR GRADE ──────────────────────────────────────────────────────
     img[:, :, 2] = np.clip(img[:, :, 2] * R_MULT, 0, 1)
