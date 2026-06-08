@@ -145,24 +145,24 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         gc.collect()
 
         # ── 6. Window composite ────────────────────────────────────────────────
-        # For true window pixels (extremely bright in dark frame): blend in a
-        # brightened version of the dark frame to recover foliage/sky detail
-        # without making the windows look dark and murky.
+        # Use the mid-exposure frame (not dark frame) to recover window detail.
+        # This preserves natural colours (green foliage) without colour casts.
         if len(images) > 1:
-            print("Compositing window detail from dark frame...")
+            print("Compositing window detail...")
             win_mask = build_window_mask(dark_frame, sigma=8.0)  # H×W×1
 
-            # Brighten the dark frame window area significantly so it shows foliage
-            # at a natural exposure (like the target image)
-            dark_f  = dark_frame.astype(np.float32) / 255.0
-            dark_f  = np.clip(dark_f * 1.8, 0, 1)  # lift dark frame toward normal exposure
-            dark_u8 = (dark_f * 255).astype(np.uint8)
+            # Use middle exposure frame for windows — better colour balance than dark frame
+            mid_idx = len(images) // 2
+            mid_frame = images[mid_idx].astype(np.float32) / 255.0
+            # Slightly tone down the mid frame's window area to avoid overexposure
+            mid_frame = np.clip(mid_frame * 0.85, 0, 1)
+            mid_u8 = (mid_frame * 255).astype(np.uint8)
 
             merged_f = merged.astype(np.float32)
-            dark_win = dark_u8.astype(np.float32)
-            composited = merged_f * (1.0 - win_mask) + dark_win * win_mask
+            mid_win  = mid_u8.astype(np.float32)
+            composited = merged_f * (1.0 - win_mask) + mid_win * win_mask
             composited = np.clip(composited, 0, 255).astype(np.uint8)
-            del merged_f, dark_win, win_mask, dark_f, dark_u8
+            del merged_f, mid_win, win_mask, mid_frame, mid_u8
             gc.collect()
         else:
             composited = merged
@@ -205,18 +205,18 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA            = 0.85   # very gentle — preserve Mertens tones
-    HI_START_RAW     = 0.88   # only pull back very blown highlights
-    HI_CAP           = 0.93   # allow bright ceiling/walls — they should be white
-    HI_STRENGTH      = 0.40   # gentle — ceiling should stay bright white
-    FILL_CUTOFF      = 0.40   # lift shadows up to midtone level (floor tiles need detail)
-    FILL_STRENGTH    = 0.35   # moderate fill to reveal dark tile detail
-    WHITES_START     = 0.80   # push whites on ceiling and walls
-    WHITES_STRENGTH  = 0.45   # moderate — ceiling should be clean white
-    R_MULT           = 1.06   # warm up reds — wood cabinets need warmth
-    G_MULT           = 1.01
-    B_MULT           = 0.96   # reduce blue cast
-    VIBRANCE         = 22.0
+    GAMMA            = 0.80   # gentle lift
+    HI_START_RAW     = 0.90   # only touch near-clipped highlights
+    HI_CAP           = 0.95   # allow bright white walls/ceiling
+    HI_STRENGTH      = 0.30   # light touch — don't darken white walls
+    FILL_CUTOFF      = 0.35   # lift true shadows only
+    FILL_STRENGTH    = 0.25   # subtle — don't grey out dark furniture
+    WHITES_START     = 0.82   # push walls and ceiling to clean white
+    WHITES_STRENGTH  = 0.50   # strong push so whites are crisp
+    R_MULT           = 1.00   # neutral — no colour grading bias
+    G_MULT           = 1.00
+    B_MULT           = 1.00
+    VIBRANCE         = 16.0
     SHARPEN_AMT      = 0.50
     SHARPEN_RADIUS   = 1.0
 
@@ -266,7 +266,7 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img[:, :, 0] = np.clip(img[:, :, 0] * B_MULT, 0, 1)
 
     # ── 8. MIDTONE LIFT CURVE ─────────────────────────────────────────────────
-    img = np.clip(img + 0.08 * np.sin(np.pi * img), 0, 1)
+    img = np.clip(img + 0.04 * np.sin(np.pi * img), 0, 1)  # subtle S-curve only
 
     # ── 9. VIBRANCE ───────────────────────────────────────────────────────────
     img_u8 = (img * 255).astype(np.uint8)
