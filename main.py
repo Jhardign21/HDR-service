@@ -205,19 +205,19 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA            = 0.80   # gentle lift
-    HI_START_RAW     = 0.90   # only touch near-clipped highlights
-    HI_CAP           = 0.95   # allow bright white walls/ceiling
-    HI_STRENGTH      = 0.30   # light touch — don't darken white walls
-    FILL_CUTOFF      = 0.35   # lift true shadows only
-    FILL_STRENGTH    = 0.25   # subtle — don't grey out dark furniture
-    WHITES_START     = 0.82   # push walls and ceiling to clean white
-    WHITES_STRENGTH  = 0.50   # strong push so whites are crisp
+    GAMMA            = 1.20   # lift interior brightness (>1.0 = brighten)
+    HI_START_RAW     = 0.88   # start pulling highlights a bit earlier
+    HI_CAP           = 0.96   # allow bright white walls/ceiling
+    HI_STRENGTH      = 0.35   # moderate highlight recovery
+    FILL_CUTOFF      = 0.45   # lift broader shadow range
+    FILL_STRENGTH    = 0.45   # stronger fill for dark interiors
+    WHITES_START     = 0.78   # push walls and ceiling to clean white
+    WHITES_STRENGTH  = 0.55   # strong push so whites are crisp
     R_MULT           = 1.00   # neutral — no colour grading bias
     G_MULT           = 1.00
     B_MULT           = 1.00
-    VIBRANCE         = 16.0
-    SHARPEN_AMT      = 0.50
+    VIBRANCE         = 18.0
+    SHARPEN_AMT      = 0.55
     SHARPEN_RADIUS   = 1.0
 
     # ── 1. WINDOW PROTECTION MASK ─────────────────────────────────────────────
@@ -229,9 +229,10 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     win_protect3 = win_protect_blurred[:, :, np.newaxis]
     interior3    = 1.0 - win_protect3
 
-    # ── 2. PRE-LIFT ───────────────────────────────────────────────────────────
-    # Gentle gamma only — no Reinhard curve on top of Mertens (already tone-mapped)
-    img = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
+    # ── 2. PRE-LIFT (interior only — windows are excluded) ───────────────────
+    # Apply gamma only to interior pixels so windows keep their original exposure
+    img_gamma = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
+    img = img_gamma * interior3 + img * win_protect3  # blend: lifted interior, original windows
     img = np.clip(img, 0, 1)
 
     # ── 3. WINDOW PULL ────────────────────────────────────────────────────────
@@ -257,8 +258,8 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img = np.clip(img, 0, 1)
 
     # ── 6. GLOBAL BRIGHTNESS BOOST (interior only) ────────────────────────────
-    # Disabled — Mertens output doesn't need a global push, it's already exposed well
-    # img = img + 0.18 * (1.0 - img) * interior3
+    img = img + 0.22 * (1.0 - img) * interior3
+    img = np.clip(img, 0, 1)
 
     # ── 7. COLOUR GRADE ──────────────────────────────────────────────────────
     img[:, :, 2] = np.clip(img[:, :, 2] * R_MULT, 0, 1)
