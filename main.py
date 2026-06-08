@@ -229,6 +229,26 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
             images = synthesize_brackets(images[0])
             dark_frame = images[0]
 
+        # ── 5b. PRE-FUSION CLAHE — normalize local histogram on each bracket ──
+        # This is the key technique used by professional pipelines (Autoenhance, AutoHDR):
+        # applying CLAHE per-frame before Mertens so the fusion algorithm sees
+        # locally-balanced frames instead of one bright and two very dark ones.
+        # Result: Mertens produces a much brighter, more evenly exposed base image.
+        print("Applying pre-fusion CLAHE to each bracket...")
+        clahe_pre = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        clahe_images = []
+        for img_pre in images:
+            lab = cv2.cvtColor(img_pre, cv2.COLOR_BGR2LAB)
+            l, a, b_ch = cv2.split(lab)
+            l_eq = clahe_pre.apply(l)
+            # Blend: 60% CLAHE, 40% original L — avoids over-flattening
+            l_blended = np.clip(l_eq * 0.6 + l * 0.4, 0, 255).astype(np.uint8)
+            lab_eq = cv2.merge([l_blended, a, b_ch])
+            clahe_images.append(cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR))
+        # Use CLAHE images for fusion but keep originals for window composite
+        images_for_fusion = clahe_images
+        gc.collect()
+
         # ── 6. GHOST DETECTION ────────────────────────────────────────────────
         mid_idx = len(images) // 2
         if len(images) > 1 and not single_shot:
@@ -256,7 +276,7 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
             contrast_weight=1.4,
             saturation_weight=0.85,
             exposure_weight=0.0,
-        ).process(images)
+        ).process(images_for_fusion)
         merged = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused
         gc.collect()
@@ -306,22 +326,23 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA              = 0.88
+    GAMMA              = 0.72   # stronger lift — target image is significantly brighter overall
     HI_START_RAW       = 0.80
     HI_CAP             = 0.88
     HI_STRENGTH        = 0.65
-    WALL_LUM_LOW       = 0.55   # zone B lower boundary
+    WALL_LUM_LOW       = 0.50   # zone B lower boundary (wider to catch more wall area)
     WALL_LUM_HIGH      = 0.90   # zone B upper boundary (above = window)
-    WALL_DESAT         = 0.55   # desaturate walls 55% → clean neutral beige/white
-    WALL_BRIGHT        = 0.08   # gentle brightness push on walls
-    WALL_CAST_STRENGTH = 0.45   # per-zone grey-world cast removal strength on walls
+    WALL_DESAT         = 0.50   # desaturate walls → clean neutral beige/white
+    WALL_BRIGHT        = 0.10   # brightness push on walls
+    WALL_CAST_STRENGTH = 0.45   # per-zone grey-world cast removal on walls
     FLOOR_LUM_HIGH     = 0.45   # floor/wood is darker than walls
-    FLOOR_WARM_BOOST   = 0.12   # warm hue push on floors (enrich hardwood)
-    FILL_CUTOFF        = 0.22
-    FILL_STRENGTH      = 0.14
-    R_MULT             = 1.03
-    G_MULT             = 0.98
-    B_MULT             = 0.93
+    FLOOR_WARM_BOOST   = 0.10   # warm hue push on floors (enrich hardwood)
+    FILL_CUTOFF        = 0.35   # wider fill — lift ALL dark interior, not just deepest shadows
+    FILL_STRENGTH      = 0.35   # strong fill — this is what opens up the dark room
+    # White balance: target is neutral-warm 5500K, not orange — back off R, boost B slightly
+    R_MULT             = 1.00   # neutral — don't push red (causes orange cast)
+    G_MULT             = 1.00
+    B_MULT             = 0.96   # slight blue cut keeps warmth without going orange
     VIBRANCE           = 14.0
     SHARPEN_AMT        = 0.65
     SHARPEN_RADIUS     = 1.0
@@ -348,6 +369,30 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img_gamma = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
     img = img_gamma * interior3 + img * win_protect3
     img = np.clip(img, 0, 1)
+
+    # ── 2b. POST-GAMMA CLAHE on interior — locally lifts dark corners/rooms ───
+    # This is the technique that makes every corner of a dark room look open and bright.
+    # Applied to LAB L-channel so colour is untouched. Blended 70/30 with original
+    # so we get lift without losing natural depth.
+    img_u8_clahe = (img * 255).astype(np.uint8)
+    lab_c = cv2.cvtColor(img_u8_clahe, cv2.COLOR_BGR2LAB)
+    l_c, a_c, b_c = cv2.split(lab_c)
+    clahe_finish = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe_finish.apply(l_c)
+    # Blend CLAHE result — apply strongly in dark zones, lightly in bright zones
+    lum_blend = l_c.astype(np.float32) / 255.0
+    clahe_strength = np.clip(1.0 - lum_blend * 1.8, 0.0, 1.0)  # dark=strong, bright=none
+    # Also exclude windows from CLAHE
+    clahe_strength = clahe_strength * (1.0 - win_protect)
+    l_final = np.clip(
+        l_c.astype(np.float32) * (1.0 - clahe_strength) + l_eq.astype(np.float32) * clahe_strength,
+        0, 255
+    ).astype(np.uint8)
+    lab_c = cv2.merge([l_final, a_c, b_c])
+    img_u8_clahe = cv2.cvtColor(lab_c, cv2.COLOR_LAB2BGR)
+    img = img_u8_clahe.astype(np.float32) / 255.0
+    del img_u8_clahe, lab_c, l_c, a_c, b_c, l_eq, l_final
+    gc.collect()
 
     # ── 3. WINDOW PULL ────────────────────────────────────────────────────────
     hi_mask = np.clip((lum_raw - HI_START_RAW) / (1.0 - HI_START_RAW), 0, 1) ** 1.5
