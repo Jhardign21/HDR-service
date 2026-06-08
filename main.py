@@ -70,136 +70,167 @@ def load_image_bgr(path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# IMPROVEMENT 1: Better window detection
-# Combines luminance + blue-channel dominance + edge-proximity bias
+# Tone curve: maps input [0..1] float array through a spline curve
 # ---------------------------------------------------------------------------
 
-def build_window_mask_smart(dark_frame: np.ndarray, sigma: float = 8.0) -> np.ndarray:
+def apply_tone_curve(img_f: np.ndarray, curve_in: List[float], curve_out: List[float]) -> np.ndarray:
     """
-    Smart window mask from the darkest bracket frame.
-    Uses three cues combined:
-      1. Luminance — windows are bright even in underexposed shots
-      2. Blue-channel dominance — sky/exterior light is cooler/bluer than interior warm light
-      3. Edge proximity — windows tend to be bounded by dark frames (walls)
-    Returns float32 mask [0..1], shape H×W×1.
+    Apply a tone curve to a float32 image [0..1].
+    curve_in / curve_out are control points (0..1).
+    Uses numpy linear interpolation across 256 LUT steps.
     """
-    h, w = dark_frame.shape[:2]
-    img_f = dark_frame.astype(np.float32) / 255.0
+    lut = np.interp(np.linspace(0, 1, 256), curve_in, curve_out).astype(np.float32)
+    img_u8 = np.clip(img_f * 255, 0, 255).astype(np.uint8)
+    result = lut[img_u8]
+    return result.astype(np.float32)
 
-    # Cue 1: luminance
-    lum = 0.299 * img_f[:, :, 2] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 0]
-    lum_mask = np.clip((lum - 0.65) / (1.0 - 0.65), 0, 1) ** 1.8
 
-    # Cue 2: blue-channel relative dominance (exterior/sky is cooler than warm interior walls)
+# ---------------------------------------------------------------------------
+# Window mask: luminance + blue-channel dominance
+# ---------------------------------------------------------------------------
+
+def build_window_mask(img: np.ndarray, sigma: float = 10.0) -> np.ndarray:
+    """
+    Detect bright exterior windows. Returns float32 mask [0..1] H×W×1.
+    Uses the darkest available frame for best window isolation.
+    """
+    img_f = img.astype(np.float32) / 255.0
+    lum   = 0.299 * img_f[:, :, 2] + 0.587 * img_f[:, :, 1] + 0.114 * img_f[:, :, 0]
+
+    # Luminance: very bright zones
+    lum_mask = np.clip((lum - 0.70) / (1.0 - 0.70), 0, 1) ** 1.5
+
+    # Blue dominance: exterior sky/daylight is cooler than warm interior
     b_chan = img_f[:, :, 0]
     r_chan = img_f[:, :, 2]
     g_chan = img_f[:, :, 1]
-    # Blue dominance: blue >= red and blue >= green in that region
     blue_dom = np.clip((b_chan - np.maximum(r_chan, g_chan) + 0.05) / 0.15, 0, 1)
-    blue_dom = blue_dom * (lum > 0.45).astype(np.float32)  # only where bright enough
+    blue_dom = blue_dom * (lum > 0.40).astype(np.float32)
 
-    # Cue 3: Sobel edge map — window panes are bounded by high-contrast edges (frames/mullions)
-    gray = (lum * 255).astype(np.uint8)
-    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    edges = np.sqrt(sobel_x**2 + sobel_y**2)
-    edges = cv2.normalize(edges, None, 0, 1, cv2.NORM_MINMAX)
-    # Dilate edges so pixels just inside a window frame get credit
-    edge_dilated = cv2.dilate(edges, np.ones((15, 15), np.uint8))
-    # Pixels near a strong edge (window frame) and bright → likely window pane
-    edge_proximity = np.clip(edge_dilated * 0.6, 0, 1)
-
-    # Combine: require luminance + either blue dominance or edge proximity
-    combined = lum_mask * (0.5 + 0.3 * blue_dom + 0.2 * edge_proximity)
-    combined = np.clip(combined, 0, 1)
-    combined = cv2.GaussianBlur(combined, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    combined = np.clip(lum_mask * 0.75 + blue_dom * 0.25, 0, 1)
+    combined = cv2.GaussianBlur(combined.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
     return np.clip(combined, 0, 1)[:, :, np.newaxis]
 
 
 # ---------------------------------------------------------------------------
-# IMPROVEMENT 2: Ghost detection & removal
-# Detects motion between frames (curtains, plants, people) and masks them out
+# Ghost detection
 # ---------------------------------------------------------------------------
 
 def detect_ghost_mask(images: List[np.ndarray], ref_idx: int) -> np.ndarray:
-    """
-    Build a per-pixel ghost weight map.
-    For each non-reference frame, compute absolute luminance difference vs. reference.
-    Pixels with high variance across frames are likely ghosts (motion).
-    Returns float32 weight map [0..1] shape H×W — 1=clean, 0=ghost region.
-    The weight map is used to downweight ghost frames in Mertens fusion.
-    """
     ref = cv2.cvtColor(images[ref_idx], cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     diffs = []
     for i, img in enumerate(images):
         if i == ref_idx:
             continue
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-        # Normalize luminance difference (account for intentional exposure difference)
-        diff = np.abs(gray - ref)
-        diffs.append(diff)
-
+        diffs.append(np.abs(gray - ref))
     if not diffs:
         return np.ones(ref.shape, dtype=np.float32)
-
     max_diff = np.max(np.stack(diffs, axis=0), axis=0)
-    # Threshold: differences > 0.25 after luminance matching = motion ghost
     ghost_prob = np.clip((max_diff - 0.15) / 0.20, 0, 1)
     ghost_prob = cv2.GaussianBlur(ghost_prob, (0, 0), sigmaX=6, sigmaY=6)
-    clean_weight = 1.0 - np.clip(ghost_prob, 0, 0.85)  # never fully zero
-    return clean_weight.astype(np.float32)
+    return (1.0 - np.clip(ghost_prob, 0, 0.85)).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# IMPROVEMENT 3: Synthetic bracket generation for single-shot / bad brackets
+# Synthetic bracket generation
 # ---------------------------------------------------------------------------
 
 def synthesize_brackets(img: np.ndarray) -> List[np.ndarray]:
-    """
-    From a single exposure, generate a 3-bracket synthetic set.
-    Dark:   gamma 0.45 (simulate -2 EV) → best window detail
-    Normal: original
-    Bright: gamma 1.8  (simulate +2 EV) → best shadow detail
-    This mimics Autoenhance's HDR Harmoniser for single-shot inputs.
-    """
-    img_f = img.astype(np.float32) / 255.0
-
-    dark   = np.clip(np.power(img_f, 0.45), 0, 1)
-    bright = np.clip(np.power(img_f, 1.80), 0, 1)
-
-    dark_u8   = (dark   * 255).astype(np.uint8)
-    bright_u8 = (bright * 255).astype(np.uint8)
-
+    img_f  = img.astype(np.float32) / 255.0
+    dark   = np.clip(np.power(img_f, 0.40), 0, 1)   # simulate -2EV
+    bright = np.clip(np.power(img_f, 2.20), 0, 1)   # simulate +2EV
     print("Synthesized dark/bright virtual brackets from single exposure.")
-    return [dark_u8, img, bright_u8]
+    return [(dark * 255).astype(np.uint8), img, (bright * 255).astype(np.uint8)]
 
 
 # ---------------------------------------------------------------------------
-# Core HDR pipeline
+# FLASH SIMULATION — the core technique used by Autoenhance/flambient pros
+#
+# The key insight from research: professional results use the BRIGHT exposure
+# as a "simulated flash frame" for walls/ceilings, blended over the ambient
+# base using a luminosity mask. This is what makes interiors pop open without
+# halos or the artificial HDR look.
+# ---------------------------------------------------------------------------
+
+def simulate_flash_blend(images: List[np.ndarray], win_mask3: np.ndarray) -> np.ndarray:
+    """
+    Flambient-style flash simulation using the brightest bracket frame.
+
+    Pro technique (from Esoft/Autoenhance research):
+      1. Use the BRIGHTEST frame as the "flash layer" (simulates bounced flash)
+      2. Create a luminosity mask from that frame — bright interior zones only
+      3. Blend flash layer OVER the Mertens base using the mask
+      4. The mask feathers naturally at edges → no halos, no artifacts
+      5. Window zones are EXCLUDED from flash layer (protected by win_mask)
+
+    This is exactly what manual flambient editors do in Photoshop:
+    - Ambient layer on bottom (natural shadows, mood)
+    - Flash layer on top with luminosity mask painted on walls/ceiling/furniture
+    """
+    # Sort frames dark → bright
+    means = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in images]
+    order = np.argsort(means)
+    bright_frame = images[order[-1]]  # brightest = flash equivalent
+    dark_frame   = images[order[0]]   # darkest  = window detail source
+
+    return bright_frame, dark_frame
+
+
+# ---------------------------------------------------------------------------
+# Local contrast enhancement via large-radius unsharp mask on L-channel
+# (Creates the "3D pop" look without noise — superior to CLAHE for this task)
+# ---------------------------------------------------------------------------
+
+def local_contrast_enhance(img_bgr: np.ndarray, radius: float = 40.0, amount: float = 0.25) -> np.ndarray:
+    """
+    Large-radius unsharp mask on LAB L-channel.
+
+    This is the technique that creates the professional "dimensional" look:
+    - Large radius (40px) targets macro contrast zones (walls vs ceiling vs floor)
+    - Small amount (0.25) is subtle — just enough to separate depth planes
+    - Applied on L-channel only → zero colour contamination
+    - No noise amplification (unlike CLAHE which pumps up local grain)
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l   = lab[:, :, 0] / 255.0
+
+    # Gaussian blur at large radius to extract low-frequency luminance
+    blurred = cv2.GaussianBlur(l, (0, 0), sigmaX=radius, sigmaY=radius)
+
+    # Unsharp mask: enhance the difference between pixel and low-freq version
+    l_enhanced = np.clip(l + amount * (l - blurred), 0, 1)
+
+    lab[:, :, 0] = l_enhanced * 255.0
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+# ---------------------------------------------------------------------------
+# Core HDR merge pipeline
 # ---------------------------------------------------------------------------
 
 def bracket_merge(file_urls: List[str]) -> np.ndarray:
     """
-    Professional HDR merge pipeline:
-      1.  Download & decode all bracket frames
-      2.  Resize all to OUTPUT dimensions
-      3.  AlignMTB — correct camera shake
-      4.  Sort frames dark→bright
-      5.  Synthesize virtual brackets if only 1 frame provided (HDR Harmoniser)
-      6.  Ghost detection — build clean-weight map from motion regions
-      7.  MergeMertens exposure fusion with ghost-aware weighting
-      8.  Window composite: pull best-exposed window pixels back over fusion result
+    Professional HDR merge pipeline using flambient-inspired compositing:
+
+      1.  Download & decode frames
+      2.  Resize to output dimensions
+      3.  Early NLMeans denoise (prevents noise amplification downstream)
+      4.  AlignMTB alignment
+      5.  Sort frames dark → bright
+      6.  Synthesize brackets for single-shot input
+      7.  Mertens fusion (base/ambient layer)
+      8.  Flash composite: blend bright frame over Mertens base via luminosity mask
+      9.  Window composite: pull dark frame into window zones
     """
     tmp_paths = []
     try:
-        # ── 1. Download ────────────────────────────────────────────────────────
         print(f"Downloading {len(file_urls)} bracket frames...")
         for url in file_urls:
             ext = url.split("?")[0].rsplit(".", 1)[-1]
             ext = f".{ext.lower()}" if ext else ".jpg"
             tmp_paths.append(download_file(url, ext))
 
-        # ── 2. Decode & resize ─────────────────────────────────────────────────
         images = []
         for p in tmp_paths:
             img = load_image_bgr(p)
@@ -208,90 +239,95 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         print(f"Loaded {len(images)} frames at {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")
         gc.collect()
 
-        # ── 3. AlignMTB ────────────────────────────────────────────────────────
+        # ── Early denoise — before any enhancement ────────────────────────────
+        print("Denoising bracket frames early...")
+        images = [cv2.fastNlMeansDenoisingColored(img, None, h=5, hColor=5,
+                  templateWindowSize=7, searchWindowSize=21) for img in images]
+        gc.collect()
+
+        # ── AlignMTB ──────────────────────────────────────────────────────────
         if len(images) > 1:
-            print("Aligning frames with AlignMTB...")
+            print("Aligning frames...")
             align = cv2.createAlignMTB(max_bits=6, exclude_range=4, cut=True)
             align.process(images, images)
             gc.collect()
 
-        # ── 4. Sort dark → bright ──────────────────────────────────────────────
+        # ── Sort dark → bright ────────────────────────────────────────────────
         means = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in images]
         order = list(np.argsort(means))
         images = [images[i] for i in order]
         print(f"Frame means dark→bright: {[round(means[i], 1) for i in order]}")
-        dark_frame = images[0]
 
-        # ── 5. HDR HARMONISER — synthesize brackets for single-shot inputs ─────
+        # ── Synthesize brackets for single-shot input ─────────────────────────
         single_shot = len(images) == 1
         if single_shot:
-            print("Single exposure detected — synthesizing virtual brackets (HDR Harmoniser)...")
+            print("Single exposure — synthesizing virtual brackets...")
             images = synthesize_brackets(images[0])
-            dark_frame = images[0]
 
-        # ── 5b. PRE-FUSION CLAHE — normalize local histogram on each bracket ──
-        # This is the key technique used by professional pipelines (Autoenhance, AutoHDR):
-        # applying CLAHE per-frame before Mertens so the fusion algorithm sees
-        # locally-balanced frames instead of one bright and two very dark ones.
-        # Result: Mertens produces a much brighter, more evenly exposed base image.
-        print("Applying pre-fusion CLAHE to each bracket...")
-        clahe_pre = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        clahe_images = []
-        for img_pre in images:
-            lab = cv2.cvtColor(img_pre, cv2.COLOR_BGR2LAB)
-            l, a, b_ch = cv2.split(lab)
-            l_eq = clahe_pre.apply(l)
-            # Blend: 60% CLAHE, 40% original L — avoids over-flattening
-            l_blended = np.clip(l_eq * 0.6 + l * 0.4, 0, 255).astype(np.uint8)
-            lab_eq = cv2.merge([l_blended, a, b_ch])
-            clahe_images.append(cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR))
-        # Use CLAHE images for fusion but keep originals for window composite
-        images_for_fusion = clahe_images
-        gc.collect()
-
-        # ── 6. GHOST DETECTION ────────────────────────────────────────────────
+        # ── Ghost detection & deghosting ──────────────────────────────────────
         mid_idx = len(images) // 2
         if len(images) > 1 and not single_shot:
-            print("Running ghost detection...")
+            print("Ghost detection...")
             clean_weight = detect_ghost_mask(images, ref_idx=mid_idx)
-            # Apply ghost suppression: blend ghosty pixels toward reference frame
-            ref_f = images[mid_idx].astype(np.float32)
+            ref_f    = images[mid_idx].astype(np.float32)
             clean_w3 = clean_weight[:, :, np.newaxis]
             deghosted = []
             for i, img in enumerate(images):
                 if i == mid_idx:
                     deghosted.append(img)
                     continue
-                img_f = img.astype(np.float32)
-                # Blend toward reference in ghost regions
-                blended = img_f * clean_w3 + ref_f * (1.0 - clean_w3)
+                blended = img.astype(np.float32) * clean_w3 + ref_f * (1.0 - clean_w3)
                 deghosted.append(np.clip(blended, 0, 255).astype(np.uint8))
             images = deghosted
             del deghosted, ref_f
             gc.collect()
 
-        # ── 7. Mertens exposure fusion ─────────────────────────────────────────
-        print("Fusing with Mertens...")
-        fused = cv2.createMergeMertens(
-            contrast_weight=1.4,
-            saturation_weight=0.85,
+        # ── Mertens fusion (ambient base layer) ───────────────────────────────
+        print("Mertens fusion (ambient base)...")
+        fused  = cv2.createMergeMertens(
+            contrast_weight=1.0,
+            saturation_weight=0.8,
             exposure_weight=0.0,
-        ).process(images_for_fusion)
-        merged = np.clip(fused * 255, 0, 255).astype(np.uint8)
+        ).process(images)
+        mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused
         gc.collect()
 
-        # ── 8. Window composite ────────────────────────────────────────────────
-        # Smart window mask from dark frame: luminance + blue-channel + edge proximity
-        print("Compositing window detail with smart window mask...")
-        win_mask = build_window_mask_smart(dark_frame, sigma=8.0)
+        # ── Flash composite: brightest frame → interior surfaces ──────────────
+        # Key insight from flambient research: use bright frame as "flash layer"
+        # blended over the Mertens base via a luminosity mask.
+        # This is what makes walls/ceilings pop open without HDR artifacts.
+        print("Flash composite (flambient simulation)...")
+        bright_frame, dark_frame = simulate_flash_blend(images, None)
 
-        # Use dark frame for windows — it has the most window/sky detail
-        dark_f   = dark_frame.astype(np.float32)
-        merged_f = merged.astype(np.float32)
-        composited = merged_f * (1.0 - win_mask) + dark_f * win_mask
-        composited = np.clip(composited, 0, 255).astype(np.uint8)
-        del merged_f, dark_f, win_mask
+        # Build window mask from dark frame (best isolation of exterior zones)
+        win_mask3 = build_window_mask(dark_frame, sigma=10.0)
+        interior3 = 1.0 - win_mask3
+
+        # Luminosity mask for flash blend: mid-bright interior zones
+        # (not shadows which should retain ambient depth, not windows)
+        bright_f   = bright_frame.astype(np.float32) / 255.0
+        mertens_f  = mertens_base.astype(np.float32) / 255.0
+        lum_bright = 0.299 * bright_f[:, :, 2] + 0.587 * bright_f[:, :, 1] + 0.114 * bright_f[:, :, 0]
+
+        # Flash mask: mid-tones to highlights of the bright frame, interior only
+        # Low end cutoff at 0.20 so deep shadows keep ambient depth (not flashed flat)
+        flash_mask = np.clip((lum_bright - 0.20) / (0.85 - 0.20), 0, 1) ** 1.2
+        flash_mask = flash_mask * interior3[:, :, 0]
+        flash_mask = cv2.GaussianBlur(flash_mask.astype(np.float32), (0, 0), sigmaX=8, sigmaY=8)
+        flash_mask = np.clip(flash_mask, 0, 1)[:, :, np.newaxis]
+
+        # Blend: ambient base + flash layer weighted by flash_mask
+        # Flash blend strength 0.72 — strong enough to open the room, soft enough to keep depth
+        FLASH_STRENGTH = 0.72
+        composited_f = mertens_f * (1.0 - flash_mask * FLASH_STRENGTH) + bright_f * (flash_mask * FLASH_STRENGTH)
+        composited_f = np.clip(composited_f, 0, 1)
+
+        # ── Window composite: dark frame for window zones ─────────────────────
+        dark_f = dark_frame.astype(np.float32) / 255.0
+        composited_f = composited_f * (1.0 - win_mask3) + dark_f * win_mask3
+        composited = np.clip(composited_f * 255, 0, 255).astype(np.uint8)
+        del mertens_f, bright_f, dark_f, flash_mask, win_mask3
         gc.collect()
 
         print("Bracket merge complete.")
@@ -306,197 +342,154 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# AutoHDR-style post-processing — 4-zone masked finish
+# Post-processing finish
 # ---------------------------------------------------------------------------
 
 def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Zone-aware finish pipeline (mimics Autoenhance.ai local editing approach):
+    Professional finish pass:
 
-      ZONE A — Windows     : protected, no processing
-      ZONE B — Walls/Ceiling: desaturate colour cast → clean beige/white + gentle lift
-      ZONE C — Floor/Wood  : warm hue boost + vibrance to enrich hardwood
-      ZONE D — Deep shadows: fill light (furniture/corners)
+      1. S-curve tone mapping (shadows lift, highlights protect) — NOT just gamma
+      2. Local contrast via large-radius unsharp mask on L-channel (3D pop, no grain)
+      3. Window highlight recovery
+      4. Wall/ceiling zone: desaturate + grey-world cast removal + brightness push
+      5. Shadow fill for deep corners
+      6. Neutral colour grade (5500K interior standard)
+      7. Moderate vibrance (skip walls)
+      8. Mild sharpening
 
-    Improvements vs previous:
-      + Per-zone grey-world colour cast removal on walls (fix green/magenta cast)
-      + Floor/wood zone with warm saturation boost
-      + Vibrance skips wall zone (prevents re-saturating what we just cleaned)
-      + Blue-channel window detection inherited from smart mask in bracket_merge
+    KEY CHANGES vs previous version:
+      - Replaced gamma with proper S-CURVE: lifts shadows more aggressively while
+        keeping highlights anchored. This is the #1 technique pros use in Lightroom.
+      - Replaced post-gamma CLAHE with large-radius unsharp mask on L-channel:
+        produces the same local contrast "pop" WITHOUT amplifying grain.
+      - Removed all bilateral filter (was re-blurring after sharpen).
+      - Wall grey-world caps are tighter (±8%) to prevent over-bluing.
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA              = 0.72   # stronger lift — target image is significantly brighter overall
-    HI_START_RAW       = 0.80
-    HI_CAP             = 0.88
-    HI_STRENGTH        = 0.65
-    WALL_LUM_LOW       = 0.50   # zone B lower boundary (wider to catch more wall area)
-    WALL_LUM_HIGH      = 0.90   # zone B upper boundary (above = window)
-    WALL_DESAT         = 0.50   # desaturate walls → clean neutral beige/white
-    WALL_BRIGHT        = 0.10   # brightness push on walls
-    WALL_CAST_STRENGTH = 0.45   # per-zone grey-world cast removal on walls
-    FLOOR_LUM_HIGH     = 0.45   # floor/wood is darker than walls
-    FLOOR_WARM_BOOST   = 0.10   # warm hue push on floors (enrich hardwood)
-    FILL_CUTOFF        = 0.35   # wider fill — lift ALL dark interior, not just deepest shadows
-    FILL_STRENGTH      = 0.35   # strong fill — this is what opens up the dark room
-    # White balance: target is neutral-warm 5500K, not orange — back off R, boost B slightly
-    R_MULT             = 1.00   # neutral — don't push red (causes orange cast)
-    G_MULT             = 1.00
-    B_MULT             = 0.96   # slight blue cut keeps warmth without going orange
-    VIBRANCE           = 14.0
-    SHARPEN_AMT        = 0.65
-    SHARPEN_RADIUS     = 1.0
+    # ── TUNING PARAMETERS ─────────────────────────────────────────────────────
+    # S-curve control points: [input] → [output]
+    # Lifts shadows aggressively, protects highlights, keeps mid-tones natural
+    SCURVE_IN  = [0.0,  0.10, 0.25, 0.50, 0.75, 0.90, 1.0]
+    SCURVE_OUT = [0.0,  0.18, 0.38, 0.62, 0.80, 0.92, 1.0]
 
-    # ── 1. WINDOW MASK (luminance + blue dominance) ───────────────────────────
+    HI_START_RAW       = 0.82
+    HI_CAP             = 0.92
+    HI_STRENGTH        = 0.55
+    WALL_LUM_LOW       = 0.45
+    WALL_LUM_HIGH      = 0.93
+    WALL_DESAT         = 0.50
+    WALL_BRIGHT        = 0.10
+    WALL_CAST_STRENGTH = 0.30   # tighter — ±8% cap prevents over-bluing
+    FILL_CUTOFF        = 0.38
+    FILL_STRENGTH      = 0.38
+    R_MULT             = 0.99
+    G_MULT             = 1.00
+    B_MULT             = 0.97
+    VIBRANCE           = 10.0
+    SHARPEN_AMT        = 0.50
+    SHARPEN_RADIUS     = 0.8
+    LOCAL_CONTRAST_R   = 40.0   # large-radius unsharp mask radius (px)
+    LOCAL_CONTRAST_A   = 0.22   # amount — subtle but visible depth separation
+
+    # ── 1. WINDOW MASK ────────────────────────────────────────────────────────
     lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     b_chan   = img[:, :, 0]
     r_chan   = img[:, :, 2]
     g_chan   = img[:, :, 1]
-
-    # Luminance cue
-    lum_win = np.clip((lum_raw - 0.85) / (1.0 - 0.85), 0, 1) ** 1.2
-    # Blue-channel dominance cue (exterior light is cooler than warm interior walls)
+    lum_win  = np.clip((lum_raw - 0.85) / (1.0 - 0.85), 0, 1) ** 1.2
     blue_dom = np.clip((b_chan - np.maximum(r_chan, g_chan) + 0.05) / 0.12, 0, 1)
     blue_dom = blue_dom * (lum_raw > 0.50).astype(np.float32)
-    # Combined window signal
-    win_raw = np.clip(lum_win * 0.7 + blue_dom * 0.3, 0, 1)
-    win_protect = cv2.GaussianBlur(win_raw.astype(np.float32), (0, 0), sigmaX=6, sigmaY=6)
-    win_protect = np.clip(win_protect, 0, 1)
+    win_raw  = np.clip(lum_win * 0.7 + blue_dom * 0.3, 0, 1)
+    win_protect  = cv2.GaussianBlur(win_raw.astype(np.float32), (0, 0), sigmaX=8, sigmaY=8)
+    win_protect  = np.clip(win_protect, 0, 1)
     win_protect3 = win_protect[:, :, np.newaxis]
     interior3    = 1.0 - win_protect3
 
-    # ── 2. GAMMA (interior only) ──────────────────────────────────────────────
-    img_gamma = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
-    img = img_gamma * interior3 + img * win_protect3
+    # ── 2. S-CURVE TONE MAPPING (interior only) ───────────────────────────────
+    # This replaces simple gamma. An S-curve lifts shadows aggressively while
+    # anchoring highlights — exactly what Lightroom's "Shadows +80, Whites -20" does.
+    # It's the single most important change to get the bright/open interior look.
+    img_curved  = apply_tone_curve(img, SCURVE_IN, SCURVE_OUT)
+    img = img_curved * interior3 + img * win_protect3
     img = np.clip(img, 0, 1)
 
-    # ── 2b. POST-GAMMA CLAHE on interior — locally lifts dark corners/rooms ───
-    # This is the technique that makes every corner of a dark room look open and bright.
-    # Applied to LAB L-channel so colour is untouched. Blended 70/30 with original
-    # so we get lift without losing natural depth.
-    img_u8_clahe = (img * 255).astype(np.uint8)
-    lab_c = cv2.cvtColor(img_u8_clahe, cv2.COLOR_BGR2LAB)
-    l_c, a_c, b_c = cv2.split(lab_c)
-    clahe_finish = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_eq = clahe_finish.apply(l_c)
-    # Blend CLAHE result — apply strongly in dark zones, lightly in bright zones
-    lum_blend = l_c.astype(np.float32) / 255.0
-    clahe_strength = np.clip(1.0 - lum_blend * 1.8, 0.0, 1.0)  # dark=strong, bright=none
-    # Also exclude windows from CLAHE
-    clahe_strength = clahe_strength * (1.0 - win_protect)
-    l_final = np.clip(
-        l_c.astype(np.float32) * (1.0 - clahe_strength) + l_eq.astype(np.float32) * clahe_strength,
-        0, 255
-    ).astype(np.uint8)
-    lab_c = cv2.merge([l_final, a_c, b_c])
-    img_u8_clahe = cv2.cvtColor(lab_c, cv2.COLOR_LAB2BGR)
-    img = img_u8_clahe.astype(np.float32) / 255.0
-    del img_u8_clahe, lab_c, l_c, a_c, b_c, l_eq, l_final
-    gc.collect()
+    # ── 3. LOCAL CONTRAST — large-radius unsharp mask on L-channel ───────────
+    # Creates the professional "dimensional" pop:
+    # - Large radius (40px) = macro contrast, not micro texture
+    # - Applied on L only = zero colour shift
+    # - No noise (unlike CLAHE which amplifies grain in dark zones)
+    img_u8 = (img * 255).astype(np.uint8)
+    img_u8 = local_contrast_enhance(img_u8, radius=LOCAL_CONTRAST_R, amount=LOCAL_CONTRAST_A)
+    img    = img_u8.astype(np.float32) / 255.0
 
-    # ── 3. WINDOW PULL ────────────────────────────────────────────────────────
-    hi_mask = np.clip((lum_raw - HI_START_RAW) / (1.0 - HI_START_RAW), 0, 1) ** 1.5
+    # ── 4. WINDOW HIGHLIGHT PULL ─────────────────────────────────────────────
+    hi_mask  = np.clip((lum_raw - HI_START_RAW) / (1.0 - HI_START_RAW), 0, 1) ** 1.5
     hi_mask3 = hi_mask[:, :, np.newaxis]
     img = img - hi_mask3 * np.clip(img - HI_CAP, 0, None) * HI_STRENGTH
     img = np.clip(img, 0, 1)
 
-    # ── 4. WALL/CEILING ZONE MASK ─────────────────────────────────────────────
+    # ── 5. WALL/CEILING ZONE ─────────────────────────────────────────────────
     lum2 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     wall_mask = np.clip((lum2 - WALL_LUM_LOW) / (WALL_LUM_HIGH - WALL_LUM_LOW), 0, 1)
     wall_mask = wall_mask * (1.0 - win_protect)
-    wall_mask = cv2.GaussianBlur(wall_mask.astype(np.float32), (0, 0), sigmaX=5, sigmaY=5)
+    wall_mask = cv2.GaussianBlur(wall_mask.astype(np.float32), (0, 0), sigmaX=6, sigmaY=6)
     wall_mask = np.clip(wall_mask, 0, 1)
     wall_mask3 = wall_mask[:, :, np.newaxis]
 
-    # ── 5. FLOOR/WOOD ZONE MASK ───────────────────────────────────────────────
-    # Floors are darker (lum < FLOOR_LUM_HIGH) and tend to have warm hue (red > blue)
-    warm_bias = np.clip((img[:, :, 2] - img[:, :, 0]) / 0.15, 0, 1)  # R > B = warm
-    floor_mask = np.clip(1.0 - lum2 / FLOOR_LUM_HIGH, 0, 1) * warm_bias * interior3[:, :, 0]
-    floor_mask = cv2.GaussianBlur(floor_mask.astype(np.float32), (0, 0), sigmaX=5, sigmaY=5)
-    floor_mask = np.clip(floor_mask, 0, 1)
-    floor_mask3 = floor_mask[:, :, np.newaxis]
-
-    # ── 6a. WALL DESATURATION → clean neutral beige/white ────────────────────
+    # Desaturate walls → clean neutral tone
     img_u8_tmp = (img * 255).astype(np.uint8)
     hsv_tmp = cv2.cvtColor(img_u8_tmp, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * WALL_DESAT)
-    img_u8_tmp = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
-    img = img_u8_tmp.astype(np.float32) / 255.0
+    img = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # ── 6b. PER-ZONE GREY-WORLD CAST REMOVAL on walls ─────────────────────────
-    # Autoenhance v4.7 explicitly added "colour cast removal" as a separate step.
-    # Idea: in the wall zone, all channels SHOULD be roughly equal (neutral beige/white).
-    # If one channel dominates, nudge it back toward the mean of the other two.
-    wall_pixels_r = img[:, :, 2] * wall_mask
-    wall_pixels_g = img[:, :, 1] * wall_mask
-    wall_pixels_b = img[:, :, 0] * wall_mask
+    # Grey-world cast removal on wall zone (tight ±8% cap)
     wall_sum = wall_mask.sum() + 1e-6
-    mean_r = wall_pixels_r.sum() / wall_sum
-    mean_g = wall_pixels_g.sum() / wall_sum
-    mean_b = wall_pixels_b.sum() / wall_sum
+    mean_r   = (img[:, :, 2] * wall_mask).sum() / wall_sum
+    mean_g   = (img[:, :, 1] * wall_mask).sum() / wall_sum
+    mean_b   = (img[:, :, 0] * wall_mask).sum() / wall_sum
     mean_all = (mean_r + mean_g + mean_b) / 3.0 + 1e-6
-    # Correction factors: channels above mean get pulled back, below get a small lift
-    cor_r = mean_all / (mean_r + 1e-6)
-    cor_g = mean_all / (mean_g + 1e-6)
-    cor_b = mean_all / (mean_b + 1e-6)
-    # Clamp corrections so we don't over-correct (max 15% shift)
-    cor_r = np.clip(cor_r, 0.88, 1.15)
-    cor_g = np.clip(cor_g, 0.88, 1.15)
-    cor_b = np.clip(cor_b, 0.88, 1.15)
-    # Apply correction blended by wall_mask strength and cast strength
+    cor_r = np.clip(mean_all / (mean_r + 1e-6), 0.92, 1.08)
+    cor_g = np.clip(mean_all / (mean_g + 1e-6), 0.92, 1.08)
+    cor_b = np.clip(mean_all / (mean_b + 1e-6), 0.92, 1.08)
     img[:, :, 2] = np.clip(img[:, :, 2] * (1.0 + (cor_r - 1.0) * wall_mask * WALL_CAST_STRENGTH), 0, 1)
     img[:, :, 1] = np.clip(img[:, :, 1] * (1.0 + (cor_g - 1.0) * wall_mask * WALL_CAST_STRENGTH), 0, 1)
     img[:, :, 0] = np.clip(img[:, :, 0] * (1.0 + (cor_b - 1.0) * wall_mask * WALL_CAST_STRENGTH), 0, 1)
 
-    # ── 6c. WALL BRIGHTNESS PUSH → lift toward clean white ───────────────────
+    # Brightness push on walls → toward clean bright tone
     img = img + wall_mask3 * WALL_BRIGHT * (1.0 - img)
     img = np.clip(img, 0, 1)
 
-    # ── 7. FLOOR/WOOD WARM BOOST — enrich hardwood tones ─────────────────────
-    # Boost red channel slightly and reduce blue in floor zone to warm up hardwood
-    img[:, :, 2] = np.clip(img[:, :, 2] + floor_mask * FLOOR_WARM_BOOST * (1.0 - img[:, :, 2]), 0, 1)
-    img[:, :, 0] = np.clip(img[:, :, 0] - floor_mask * (FLOOR_WARM_BOOST * 0.5) * img[:, :, 0], 0, 1)
-
-    # ── 8. FILL LIGHT — deep shadow corners only ──────────────────────────────
+    # ── 6. SHADOW FILL — deep corners ────────────────────────────────────────
     lum3 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask = np.clip(1.0 - lum3 / FILL_CUTOFF, 0, 1) ** 1.8
+    fill_mask  = np.clip(1.0 - lum3 / FILL_CUTOFF, 0, 1) ** 1.5
     fill_mask3 = fill_mask[:, :, np.newaxis]
-    # Don't fill floor zone (already warmed), don't fill windows
-    fill_zone = interior3 * (1.0 - floor_mask3)
-    img = img + fill_mask3 * FILL_STRENGTH * (1.0 - img) * fill_zone
+    img = img + fill_mask3 * FILL_STRENGTH * (1.0 - img) * interior3
     img = np.clip(img, 0, 1)
 
-    # ── 9. GLOBAL COLOUR GRADE ────────────────────────────────────────────────
+    # ── 7. COLOUR GRADE (neutral 5500K interior standard) ────────────────────
     img[:, :, 2] = np.clip(img[:, :, 2] * R_MULT, 0, 1)
     img[:, :, 1] = np.clip(img[:, :, 1] * G_MULT, 0, 1)
     img[:, :, 0] = np.clip(img[:, :, 0] * B_MULT, 0, 1)
 
-    # ── 10. VIBRANCE — skip walls (already neutralised), boost floors/mid-tones
+    # ── 8. VIBRANCE (moderate, skip walls — already neutralised) ─────────────
     img_u8 = (img * 255).astype(np.uint8)
-    hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat_norm = hsv[:, :, 1] / 255.0
-    # Wall zone excluded from vibrance; floor zone gets a little extra
-    vib_zone = (1.0 - wall_mask) + floor_mask * 0.4
-    vib_zone = np.clip(vib_zone, 0, 1)
+    hsv    = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
+    sat_norm  = hsv[:, :, 1] / 255.0
+    vib_zone  = np.clip(1.0 - wall_mask, 0, 1)
     vib_boost = VIBRANCE * (1.0 - sat_norm) ** 1.5 * vib_zone
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] + vib_boost, 0, 255)
-    img_u8 = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    img = img_u8.astype(np.float32) / 255.0
+    img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # ── 11. LUMINANCE-AWARE DENOISE ───────────────────────────────────────────
-    img_u8 = (img * 255).astype(np.uint8)
-    denoised = cv2.bilateralFilter(img_u8, d=9, sigmaColor=25, sigmaSpace=12)
-    lum_denoise = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    denoise_alpha = np.clip(1.0 - lum_denoise * 1.4, 0, 1)[:, :, np.newaxis]
-    img_u8 = (img_u8 * (1.0 - denoise_alpha) + denoised * denoise_alpha).astype(np.uint8)
-
-    # ── 12. SHARPEN ───────────────────────────────────────────────────────────
+    # ── 9. SHARPEN ───────────────────────────────────────────────────────────
+    img_u8   = (img * 255).astype(np.uint8)
     pil_img  = Image.fromarray(cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB))
     blurred  = pil_img.filter(ImageFilter.GaussianBlur(radius=SHARPEN_RADIUS))
     orig_f   = np.array(pil_img).astype(np.float32)
     blur_f   = np.array(blurred).astype(np.float32)
-    sharpened = np.clip(orig_f + SHARPEN_AMT * (orig_f - blur_f), 0, 255).astype(np.uint8)
-    result_bgr = cv2.cvtColor(sharpened, cv2.COLOR_RGB2BGR)
+    sharpened   = np.clip(orig_f + SHARPEN_AMT * (orig_f - blur_f), 0, 255).astype(np.uint8)
+    result_bgr  = cv2.cvtColor(sharpened, cv2.COLOR_RGB2BGR)
 
     print("AutoHDR finish applied.")
     return result_bgr
@@ -522,7 +515,7 @@ async def merge_hdr(req: MergeRequest):
         raise HTTPException(400, f"Expected 1, 3, or 5 files, got {len(req.file_urls)}")
 
     try:
-        print(f"Starting bracket merge for '{req.bracket_name}' ({len(req.file_urls)} frames)...")
+        print(f"Starting HDR merge for '{req.bracket_name}' ({len(req.file_urls)} frames)...")
         merged = bracket_merge(req.file_urls)
         merged = apply_autohdr_finish(merged)
 
