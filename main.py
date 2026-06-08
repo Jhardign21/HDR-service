@@ -184,81 +184,91 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
 def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
-    AutoHDR "Classic" finish pipeline.
-
-    NOTE: Window protection here is intentionally LIGHTER than before —
-    the bracket_merge() already composited real window detail from the dark
-    frame, so we only need to prevent any remaining highlight clipping.
+    AutoHDR "Classic" finish pipeline — 3-zone masked approach:
+      ZONE A: Windows      — fully protected, dark-frame composited in bracket_merge
+      ZONE B: Walls/Ceiling (bright interior) — desaturated to clean beige/white, light brightness push
+      ZONE C: Dark interior (floors, furniture) — gentle fill light only
 
     Pipeline:
-    1.  Build window protection mask from input luminance (post-merge)
-    2.  Pre-lift: filmic Reinhard curve + gamma
-    3.  Window pull: soft cap on any remaining blown highlights
-    4.  Fill light: lift dark interior zones (windows excluded)
-    5.  Whites push: clean white on ceilings/walls (windows excluded)
-    6.  Global brightness boost (interior only)
-    7.  Colour grade: neutral-warm
-    8.  Midtone lift curve
-    9.  Vibrance
-    10. Luminance-aware denoise
-    11. Sharpen
+    1.  Window mask  — protect bright exterior pixels from any interior processing
+    2.  Gamma        — applied to interior only (zones B+C)
+    3.  Window pull  — soft cap on remaining blown highlights
+    4.  Wall/ceiling desaturation mask — reduce saturation on bright interior zones → clean beige/white
+    5.  Wall brightness push — gently lift walls/ceiling toward clean white
+    6.  Fill light   — lift only deep shadows (zone C), preserve dark floors
+    7.  Colour grade — warm cast, cut blue
+    8.  Vibrance     — boost only low-saturation areas (floors/wood), skip walls
+    9.  Denoise + Sharpen
     """
     img = img_bgr.astype(np.float32) / 255.0
 
-    GAMMA            = 1.20   # lift interior brightness (>1.0 = brighten)
-    HI_START_RAW     = 0.88   # start pulling highlights a bit earlier
-    HI_CAP           = 0.96   # allow bright white walls/ceiling
-    HI_STRENGTH      = 0.35   # moderate highlight recovery
-    FILL_CUTOFF      = 0.45   # lift broader shadow range
-    FILL_STRENGTH    = 0.45   # stronger fill for dark interiors
-    WHITES_START     = 0.78   # push walls and ceiling to clean white
-    WHITES_STRENGTH  = 0.55   # strong push so whites are crisp
-    R_MULT           = 1.00   # neutral — no colour grading bias
-    G_MULT           = 1.00
-    B_MULT           = 1.00
-    VIBRANCE         = 18.0
-    SHARPEN_AMT      = 0.55
-    SHARPEN_RADIUS   = 1.0
+    GAMMA              = 0.88   # slight pull-back — Mertens already lifts
+    HI_START_RAW       = 0.80   # window pull threshold
+    HI_CAP             = 0.88   # cap blown windows
+    HI_STRENGTH        = 0.65
+    # Wall/ceiling zone (bright interior, NOT windows)
+    WALL_LUM_LOW       = 0.55   # walls start above this luminance
+    WALL_LUM_HIGH      = 0.90   # above this = probably window, skip
+    WALL_DESAT         = 0.55   # how much to desaturate walls/ceiling (0=none, 1=full grey)
+    WALL_BRIGHT        = 0.08   # gentle brightness push on walls toward white
+    # Shadow fill (dark interior only)
+    FILL_CUTOFF        = 0.22   # only pixels below this lum get fill
+    FILL_STRENGTH      = 0.14
+    R_MULT             = 1.03
+    G_MULT             = 0.98
+    B_MULT             = 0.93
+    VIBRANCE           = 14.0
+    SHARPEN_AMT        = 0.60
+    SHARPEN_RADIUS     = 1.0
 
-    # ── 1. WINDOW PROTECTION MASK ─────────────────────────────────────────────
+    # ── 1. WINDOW MASK ────────────────────────────────────────────────────────
+    # Tight mask: only true window glass (very high lum in raw image)
     lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    WIN_THRESH = 0.92  # only protect extreme window blowout, not ceiling/walls
-    win_protect = np.clip((lum_raw - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 0.8
-    win_protect_blurred = cv2.GaussianBlur(win_protect, (0, 0), sigmaX=5, sigmaY=5)
-    win_protect_blurred = np.clip(win_protect_blurred, 0, 1)
-    win_protect3 = win_protect_blurred[:, :, np.newaxis]
-    interior3    = 1.0 - win_protect3
+    WIN_THRESH = 0.88
+    win_protect = np.clip((lum_raw - WIN_THRESH) / (1.0 - WIN_THRESH), 0, 1) ** 1.2
+    win_protect = cv2.GaussianBlur(win_protect, (0, 0), sigmaX=6, sigmaY=6)
+    win_protect = np.clip(win_protect, 0, 1)
+    win_protect3 = win_protect[:, :, np.newaxis]
+    interior3    = 1.0 - win_protect3   # everything that is NOT a window
 
-    # ── 2. PRE-LIFT (interior only — windows are excluded) ───────────────────
-    # Apply gamma only to interior pixels so windows keep their original exposure
+    # ── 2. GAMMA (interior only) ──────────────────────────────────────────────
     img_gamma = np.power(np.clip(img, 1e-6, 1.0), GAMMA)
-    img = img_gamma * interior3 + img * win_protect3  # blend: lifted interior, original windows
+    img = img_gamma * interior3 + img * win_protect3
     img = np.clip(img, 0, 1)
 
     # ── 3. WINDOW PULL ────────────────────────────────────────────────────────
-    hi_mask_raw = np.clip((lum_raw - HI_START_RAW) / (1.0 - HI_START_RAW), 0, 1) ** 1.5
-    hi_mask3 = hi_mask_raw[:, :, np.newaxis]
+    hi_mask = np.clip((lum_raw - HI_START_RAW) / (1.0 - HI_START_RAW), 0, 1) ** 1.5
+    hi_mask3 = hi_mask[:, :, np.newaxis]
     img = img - hi_mask3 * np.clip(img - HI_CAP, 0, None) * HI_STRENGTH
     img = np.clip(img, 0, 1)
 
-    # ── 4. FILL LIGHT (interior only) ─────────────────────────────────────────
+    # ── 4. WALL/CEILING MASK — bright interior pixels, excluding windows ──────
+    # After gamma, recompute luminance to find wall/ceiling zone
     lum2 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask = np.clip(1.0 - lum2 / FILL_CUTOFF, 0, 1) ** 1.8
-    fill_mask3 = fill_mask[:, :, np.newaxis]
-    delta_fill = fill_mask3 * FILL_STRENGTH * (1.0 - img)
-    img = img + delta_fill * interior3
+    # Soft mask: pixels in [WALL_LUM_LOW .. WALL_LUM_HIGH] AND not a window
+    wall_mask = np.clip((lum2 - WALL_LUM_LOW) / (WALL_LUM_HIGH - WALL_LUM_LOW), 0, 1)
+    wall_mask = wall_mask * (1.0 - win_protect)  # exclude windows
+    wall_mask = cv2.GaussianBlur(wall_mask.astype(np.float32), (0, 0), sigmaX=4, sigmaY=4)
+    wall_mask = np.clip(wall_mask, 0, 1)
+    wall_mask3 = wall_mask[:, :, np.newaxis]
+
+    # ── 5a. DESATURATE walls/ceiling → clean beige/white ─────────────────────
+    img_u8_tmp = (img * 255).astype(np.uint8)
+    hsv_tmp = cv2.cvtColor(img_u8_tmp, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # Reduce saturation in wall zone
+    hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * WALL_DESAT)
+    img_u8_tmp = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    img = img_u8_tmp.astype(np.float32) / 255.0
+
+    # ── 5b. BRIGHTNESS PUSH on walls/ceiling (gentle lift toward white) ───────
+    img = img + wall_mask3 * WALL_BRIGHT * (1.0 - img)
     img = np.clip(img, 0, 1)
 
-    # ── 5. WHITES PUSH (interior only) ────────────────────────────────────────
+    # ── 6. FILL LIGHT — deep shadow zone (floors, dark furniture) only ────────
     lum3 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    white_mask = np.clip((lum3 - WHITES_START) / (1.0 - WHITES_START), 0, 1) ** 2.0
-    white_mask3 = white_mask[:, :, np.newaxis]
-    delta_white = white_mask3 * (1.0 - img) * WHITES_STRENGTH
-    img = img + delta_white * interior3
-    img = np.clip(img, 0, 1)
-
-    # ── 6. GLOBAL BRIGHTNESS BOOST (interior only) ────────────────────────────
-    img = img + 0.22 * (1.0 - img) * interior3
+    fill_mask = np.clip(1.0 - lum3 / FILL_CUTOFF, 0, 1) ** 1.8
+    fill_mask3 = fill_mask[:, :, np.newaxis]
+    img = img + fill_mask3 * FILL_STRENGTH * (1.0 - img) * interior3
     img = np.clip(img, 0, 1)
 
     # ── 7. COLOUR GRADE ──────────────────────────────────────────────────────
@@ -266,26 +276,24 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img[:, :, 1] = np.clip(img[:, :, 1] * G_MULT, 0, 1)
     img[:, :, 0] = np.clip(img[:, :, 0] * B_MULT, 0, 1)
 
-    # ── 8. MIDTONE LIFT CURVE ─────────────────────────────────────────────────
-    img = np.clip(img + 0.04 * np.sin(np.pi * img), 0, 1)  # subtle S-curve only
-
-    # ── 9. VIBRANCE ───────────────────────────────────────────────────────────
+    # ── 8. VIBRANCE — skip walls (already desaturated), boost floors/wood ─────
     img_u8 = (img * 255).astype(np.uint8)
     hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
     sat_norm = hsv[:, :, 1] / 255.0
-    vib_boost = VIBRANCE * (1.0 - sat_norm) ** 1.5
+    # Apply vibrance only to non-wall zones to avoid re-saturating walls
+    vib_boost = VIBRANCE * (1.0 - sat_norm) ** 1.5 * (1.0 - wall_mask)
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] + vib_boost, 0, 255)
     img_u8 = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     img = img_u8.astype(np.float32) / 255.0
 
-    # ── 10. LUMINANCE-AWARE DENOISE ───────────────────────────────────────────
+    # ── 9. LUMINANCE-AWARE DENOISE ────────────────────────────────────────────
     img_u8 = (img * 255).astype(np.uint8)
     denoised = cv2.bilateralFilter(img_u8, d=9, sigmaColor=25, sigmaSpace=12)
     lum_denoise = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     denoise_alpha = np.clip(1.0 - lum_denoise * 1.4, 0, 1)[:, :, np.newaxis]
     img_u8 = (img_u8 * (1.0 - denoise_alpha) + denoised * denoise_alpha).astype(np.uint8)
 
-    # ── 11. SHARPEN ───────────────────────────────────────────────────────────
+    # ── 10. SHARPEN ───────────────────────────────────────────────────────────
     pil_img = Image.fromarray(cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB))
     blurred  = pil_img.filter(ImageFilter.GaussianBlur(radius=SHARPEN_RADIUS))
     orig_f   = np.array(pil_img).astype(np.float32)
