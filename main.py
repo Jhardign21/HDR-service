@@ -427,7 +427,7 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         raw_images = []
         for p in tmp_paths:
             img = load_image_bgr(p)
-            img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+            img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_AREA)
             raw_images.append(img)
         print(f"Loaded {len(raw_images)} frames at {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}")
 
@@ -466,11 +466,12 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         print(f"  Dark frame mean: {means_raw[0]:.1f}")
 
         # ── Phase 2: Denoise raw frames ───────────────────────────────────────
-        print("Denoising...")
-        raw_images = [cv2.fastNlMeansDenoisingColored(img, None, h=5, hColor=5,
-                      templateWindowSize=7, searchWindowSize=21) for img in raw_images]
-        best_window_frame = cv2.fastNlMeansDenoisingColored(best_window_frame, None,
-                            h=5, hColor=5, templateWindowSize=7, searchWindowSize=21)
+        # Bilateral filter: smooths flat walls, preserves window frame/mullion edges
+        print("Denoising (bilateral)...")
+        raw_images = [cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+                      for img in raw_images]
+        best_window_frame = cv2.bilateralFilter(best_window_frame, d=9,
+                            sigmaColor=75, sigmaSpace=75)
         gc.collect()
 
         # ── Phase 2e-f: Exposure normalisation ────────────────────────────────
@@ -511,12 +512,11 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused; gc.collect()
 
-        # Post-fusion: CLAHE on L-channel to lift dark interior corners
-        # (same technique as reference pipeline — brightens shadows without blowing windows)
+        # Post-fusion: very mild CLAHE — just enough to lift dark corners without halos
         print("Applying CLAHE to Mertens base...")
         lab = cv2.cvtColor(mertens_base, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=0.8, tileGridSize=(16, 16))
         l = clahe.apply(l)
         mertens_base = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
@@ -547,23 +547,22 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
                         0.587 * interior_f[:, :, 1] +
                         0.114 * interior_f[:, :, 0])
 
-        # Hard threshold at 0.88 on the merged interior (slightly lower than 0.94
-        # since our interior is already tone-mapped, not raw bright)
-        blown_hard = (lum_interior > 0.88).astype(np.uint8) * 255
-        # Morphological close to fill gaps between window panes / mullions
-        close_k    = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+        # Threshold at 0.92 — only truly blown pixels, not bright walls/ceiling
+        blown_hard = (lum_interior > 0.92).astype(np.uint8) * 255
+        # Small close to fill mullion gaps only — don't bleed onto curtains/couch
+        close_k    = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         blown_hard = cv2.morphologyEx(blown_hard, cv2.MORPH_CLOSE, close_k)
-        # Dilate outward to cover bright spill on sills and frames
-        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+        # Minimal dilation — just enough to cover window sill, not furniture
+        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8))
         blown_hard = cv2.dilate(blown_hard, dilate_k)
-        # Smooth edges for natural blend (reference uses GaussianBlur (21,21))
+        # Smooth edges
         blown_mask = cv2.GaussianBlur(blown_hard.astype(np.float32) / 255.0,
-                                      (41, 41), 0)
+                                      (21, 21), 0)
         blown_mask = np.clip(blown_mask, 0, 1)[:, :, np.newaxis]
 
-        # SECONDARY MASK: union with pre-computed dark-frame window mask
-        # so we also catch zones the interior mask might miss (e.g. curtain spill)
-        combined_mask = np.clip(blown_mask + win_mask3 * 0.5, 0, 1)
+        # SECONDARY MASK: only use pre-computed dark-frame mask at low weight
+        # — prevents it from darkening curtains/frames outside the true glass zone
+        combined_mask = np.clip(blown_mask + win_mask3 * 0.25, 0, 1)
 
         # Blend: blown/window zones → exterior dark frame; room → interior
         composited_f = interior_f * (1.0 - combined_mask) + win_frame_f * combined_mask
