@@ -7,7 +7,7 @@ import cv2
 import requests
 import tempfile
 import os
-from PIL import Image, ImageFilter
+from PIL import Image
 import io
 import base64
 import gc
@@ -496,11 +496,11 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
         # ── Phase 2: Denoise raw frames ───────────────────────────────────────
         # Bilateral filter: smooths flat walls, preserves window frame/mullion edges
-        print("Denoising (bilateral)...")
-        raw_images = [cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+        print("Denoising (bilateral - light pass to preserve texture)...")
+        raw_images = [cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
                       for img in raw_images]
-        best_window_frame = cv2.bilateralFilter(best_window_frame, d=9,
-                            sigmaColor=75, sigmaSpace=75)
+        best_window_frame = cv2.bilateralFilter(best_window_frame, d=5,
+                            sigmaColor=45, sigmaSpace=45)
         gc.collect()
 
         # ── Phase 2e-f: Exposure normalisation ────────────────────────────────
@@ -534,21 +534,25 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
         print("Mertens fusion (interior base)...")
         fused = cv2.createMergeMertens(
-            contrast_weight=1.0,
-            saturation_weight=0.8,
-            exposure_weight=0.0,
+            contrast_weight=1.5,
+            saturation_weight=1.2,
+            exposure_weight=0.0,   # 0.0 = no milky gray midtone pull from Mertens
         ).process(norm_images)
         mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused; gc.collect()
 
-        # Post-fusion: mild CLAHE + yellow cast neutralization on bright zones
-        print("Applying CLAHE + yellow neutralization to Mertens base...")
+        # Post-fusion: strong CLAHE + LAB b-channel ceiling fix
+        print("Applying CLAHE + ceiling color fix to Mertens base...")
         lab = cv2.cvtColor(mertens_base, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=0.4, tileGridSize=(32, 32))
+        l, a, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
-        mertens_base = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-        mertens_base = neutralize_yellow_cast(mertens_base)
+        # Force bright zones (ceiling/walls L>195) toward neutral on b-channel
+        _, bright_spots = cv2.threshold(l, 195, 255, cv2.THRESH_BINARY)
+        b_ch = np.where(bright_spots == 255,
+                        cv2.addWeighted(b_ch, 0.65, np.full_like(b_ch, 128), 0.35, 0),
+                        b_ch)
+        mertens_base = cv2.cvtColor(cv2.merge((l, a, b_ch)), cv2.COLOR_LAB2BGR)
 
         # ── Phase 3i-j: Start from Mertens, boost dark interior zones ─────────
         print("Interior composite...")
@@ -681,15 +685,14 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * 0.55)  # was 0.45
     img = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # Grey-world cast removal (±10% cap — wider to fix yellow-green cast)
+    # Subtle b-channel pull only — removes yellow-green without touching warm beige tone
     wall_sum = wall_mask.sum() + 1e-6
-    mean_r   = (img[:, :, 2] * wall_mask).sum() / wall_sum
-    mean_g   = (img[:, :, 1] * wall_mask).sum() / wall_sum
     mean_b   = (img[:, :, 0] * wall_mask).sum() / wall_sum
-    mean_all = (mean_r + mean_g + mean_b) / 3.0 + 1e-6
-    for ch, mean_ch in [(2, mean_r), (1, mean_g), (0, mean_b)]:
-        cor = np.clip(mean_all / (mean_ch + 1e-6), 0.90, 1.10)  # was 0.92/1.08
-        img[:, :, ch] = np.clip(img[:, :, ch] * (1.0 + (cor - 1.0) * wall_mask * 0.35), 0, 1)  # was 0.25
+    mean_g   = (img[:, :, 1] * wall_mask).sum() / wall_sum
+    # Only correct if blue is significantly lower than green (yellow-green cast present)
+    if mean_g > mean_b * 1.08:
+        cor_b = np.clip(mean_g / (mean_b + 1e-6), 1.0, 1.06)
+        img[:, :, 0] = np.clip(img[:, :, 0] * (1.0 + (cor_b - 1.0) * wall_mask * 0.30), 0, 1)
 
     # Brightness push on walls
     img = img + wall_mask3 * 0.08 * (1.0 - img)
@@ -702,19 +705,20 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img = img + fill_mask3 * 0.40 * (1.0 - img) * interior3  # stronger fill
     img = np.clip(img, 0, 1)
 
-    # ── 5b. Ceiling whitening — desaturate + brighten very high-lum interior zones
+    # ── 5b. Ceiling whitening — wider mask, stronger desat + brighten
     lum_ceil  = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    ceil_mask = np.clip((lum_ceil - 0.70) / (1.0 - 0.70 + 1e-6), 0, 1) ** 1.5
+    # Lower threshold to 0.55 to catch more of the ceiling/upper walls
+    ceil_mask = np.clip((lum_ceil - 0.55) / (1.0 - 0.55 + 1e-6), 0, 1) ** 1.2
     ceil_mask = ceil_mask * (1.0 - win_protect)  # skip windows
-    ceil_mask = cv2.GaussianBlur(ceil_mask.astype(np.float32), (0, 0), 15, 15)
+    ceil_mask = cv2.GaussianBlur(ceil_mask.astype(np.float32), (0, 0), 20, 20)
     ceil_mask = np.clip(ceil_mask, 0, 1)
-    # Desaturate (remove tan cast)
+    # Very heavy desaturation — removes tan/beige cast from ceiling
     img_u8_ceil = (img * 255).astype(np.uint8)
     hsv_ceil = cv2.cvtColor(img_u8_ceil, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv_ceil[:, :, 1] = hsv_ceil[:, :, 1] * (1.0 - ceil_mask * 0.80)  # heavy desat
+    hsv_ceil[:, :, 1] = hsv_ceil[:, :, 1] * (1.0 - ceil_mask * 0.92)  # near-full desat
     img = cv2.cvtColor(np.clip(hsv_ceil, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
-    # Brightness push toward white
-    img = img + ceil_mask[:, :, np.newaxis] * 0.10 * (1.0 - img)
+    # Strong brightness push toward white on ceiling
+    img = img + ceil_mask[:, :, np.newaxis] * 0.18 * (1.0 - img)
     img = np.clip(img, 0, 1)
 
     # ── 6. Colour grade — R+5%, G+1%, B-7% warm beige tone ───────────────────
@@ -731,16 +735,21 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] + vib_boost, 0, 255)
     img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # ── 8. Sharpening (0.55 amount, 1.2px radius) ────────────────────────────
-    img_u8    = (img * 255).astype(np.uint8)
-    pil_img   = Image.fromarray(cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB))
-    blurred   = pil_img.filter(ImageFilter.GaussianBlur(radius=1.2))  # was 0.8
-    sharpened = np.clip(
-        np.array(pil_img).astype(np.float32) + 0.55 * (   # was 0.45
-            np.array(pil_img).astype(np.float32) - np.array(blurred).astype(np.float32)
-        ), 0, 255
-    ).astype(np.uint8)
-    result_bgr = cv2.cvtColor(sharpened, cv2.COLOR_RGB2BGR)
+    # ── 8. Sharpening: Laplacian edge pop + unsharp micro-contrast pass ──────
+    img_u8 = (img * 255).astype(np.uint8)
+    # Laplacian high-pass on L channel — pops architectural lines without grain
+    lab_sharp = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
+    l_s, a_s, b_s = cv2.split(lab_sharp)
+    laplacian = cv2.Laplacian(l_s, cv2.CV_64F, ksize=3)
+    laplacian = np.clip(np.absolute(laplacian), 0, 255).astype(np.uint8)
+    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.30, 0)
+    img_u8 = cv2.cvtColor(cv2.merge((l_s, a_s, b_s)), cv2.COLOR_LAB2BGR)
+    # Final micro-contrast unsharp mask (removes residual haze)
+    kernel_sharpen = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]], dtype=np.float32)
+    sharpened = cv2.filter2D(img_u8, -1, kernel_sharpen)
+    img_u8 = cv2.addWeighted(img_u8, 0.88, sharpened, 0.12, 0)
+    # Light bilateral AFTER all color work — smooths noise, keeps hard edges
+    result_bgr = cv2.bilateralFilter(img_u8, d=5, sigmaColor=35, sigmaSpace=35)
 
     mean_final = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY).mean()
     print(f"Finish applied. Final mean: {mean_final:.1f}/255")
