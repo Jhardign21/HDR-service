@@ -240,20 +240,21 @@ def build_window_mask_from_raw(dark_raw: np.ndarray, sigma: float = 12.0) -> np.
     lum  = 0.299 * f[:, :, 2] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 0]
 
     # ── Phase A: Photometric mask ─────────────────────────────────────────────
-    hard_thresh = (lum > 0.78).astype(np.uint8) * 255
-    kernel      = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    # Lower threshold to 0.65 to catch windows not fully blown on dark frame
+    hard_thresh = (lum > 0.65).astype(np.uint8) * 255
+    kernel      = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
     hard_closed = cv2.morphologyEx(hard_thresh, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(hard_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     photo_mask  = np.zeros((h, w), dtype=np.float32)
-    min_window_area = (h * w) * 0.005
+    min_window_area = (h * w) * 0.003  # slightly smaller min area to catch all panes
 
     for cnt in contours:
         if cv2.contourArea(cnt) >= min_window_area:
             cv2.drawContours(photo_mask, [cnt], -1, 1.0, thickness=cv2.FILLED)
 
-    # Soft spill around blown-out zones
-    spill = np.clip((lum - 0.88) / (1.0 - 0.88 + 1e-6), 0, 1) ** 1.5
-    photo_combined = np.clip(photo_mask + spill * 0.5, 0, 1)
+    # Soft spill around bright zones
+    spill = np.clip((lum - 0.75) / (1.0 - 0.75 + 1e-6), 0, 1) ** 1.5
+    photo_combined = np.clip(photo_mask + spill * 0.6, 0, 1)
 
     # ── Phase B: Geometric mask (LSD) ────────────────────────────────────────
     print("  Running LSD line detection for geometric window candidates...")
@@ -518,19 +519,23 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
         # ── Phase 3k: Window composite from best raw window frame ─────────────
         print("Window composite...")
-        win_frame_normed = normalise_to_target(best_window_frame, target_mean=90.0)
+        # Use dark frame as-is (no normalisation) to preserve exterior detail
+        # Just a gentle exposure lift to make exterior visible but not blown
+        win_frame_normed = normalise_to_target(best_window_frame, target_mean=65.0)
         win_frame_f      = win_frame_normed.astype(np.float32) / 255.0
 
+        # Hard composite: window zones get raw dark frame data (exterior detail)
         composited_f = interior_f * (1.0 - win_mask3) + win_frame_f * win_mask3
         composited_f = np.clip(composited_f, 0, 1)
 
         # Spill blend: near-window hot spots pulled toward window frame
+        # Lower threshold (0.75) to catch more overexposed spill near window edges
         lum_int    = 0.299 * interior_f[:, :, 2] + 0.587 * interior_f[:, :, 1] + 0.114 * interior_f[:, :, 0]
-        spill_mask = np.clip((lum_int - 0.82) / (1.0 - 0.82 + 1e-6), 0, 1) ** 2.0
+        spill_mask = np.clip((lum_int - 0.75) / (1.0 - 0.75 + 1e-6), 0, 1) ** 2.0
         spill_mask = spill_mask * (1.0 - win_mask)
         spill_mask = cv2.GaussianBlur(spill_mask.astype(np.float32), (0, 0), 8, 8)
-        spill_mask = np.clip(spill_mask, 0, 0.60)[:, :, np.newaxis]
-        composited_f = composited_f * (1.0 - spill_mask * 0.4) + win_frame_f * (spill_mask * 0.4)
+        spill_mask = np.clip(spill_mask, 0, 0.75)[:, :, np.newaxis]
+        composited_f = composited_f * (1.0 - spill_mask * 0.6) + win_frame_f * (spill_mask * 0.6)
         composited_f = np.clip(composited_f, 0, 1)
 
         composited = np.clip(composited_f * 255, 0, 255).astype(np.uint8)
@@ -575,11 +580,12 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     # ── Window protect mask ───────────────────────────────────────────────────
     lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     b_chan, g_chan, r_chan = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-    lum_win  = np.clip((lum_raw - 0.72) / (1.0 - 0.72 + 1e-6), 0, 1) ** 1.5  # earlier rolloff at 0.72
+    # Lower threshold to 0.58 — protect windows more aggressively from gamma lift
+    lum_win  = np.clip((lum_raw - 0.58) / (1.0 - 0.58 + 1e-6), 0, 1) ** 1.2
     blue_dom = np.clip((b_chan - np.maximum(r_chan, g_chan) + 0.05) / 0.12, 0, 1)
-    blue_dom = blue_dom * (lum_raw > 0.50).astype(np.float32)
-    win_raw      = np.clip(lum_win * 0.7 + blue_dom * 0.3, 0, 1)
-    win_protect  = cv2.GaussianBlur(win_raw.astype(np.float32), (0, 0), 10, 10)
+    blue_dom = blue_dom * (lum_raw > 0.45).astype(np.float32)
+    win_raw      = np.clip(lum_win * 0.8 + blue_dom * 0.2, 0, 1)
+    win_protect  = cv2.GaussianBlur(win_raw.astype(np.float32), (0, 0), 12, 12)
     win_protect  = np.clip(win_protect, 0, 1)
     win_protect3 = win_protect[:, :, np.newaxis]
     interior3    = 1.0 - win_protect3
