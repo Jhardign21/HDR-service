@@ -585,7 +585,7 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         composited_f = interior_f * (1.0 - combined_mask) + win_frame_f * combined_mask
         composited_f = np.clip(composited_f, 0, 1)
 
-        print(f"  Window pull: {blown_mask.mean()*100:.1f}% of image replaced")
+        print(f"  Window pull: {combined_mask.mean()*100:.1f}% of image replaced")
 
         composited = np.clip(composited_f * 255, 0, 255).astype(np.uint8)
         del mertens_f, bright_f, win_frame_f, composited_f, win_mask3, mertens_base
