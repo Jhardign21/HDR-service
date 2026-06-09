@@ -458,8 +458,12 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         interior3 = 1.0 - win_mask3
 
         # ── Phase 1d: Select best window-detail frame ─────────────────────────
-        print("Selecting best window-detail frame...")
-        best_window_frame = select_best_window_frame(raw_images, win_mask)
+        # For window pull we ALWAYS want the darkest raw frame — it has the most
+        # exterior detail. Edge-score selection can pick a mid/bright frame when
+        # window mullions are sharp there, which is the wrong source for exterior.
+        print("Using darkest raw frame as window source (best exterior detail)...")
+        best_window_frame = raw_images[0]  # darkest = most exterior detail
+        print(f"  Dark frame mean: {means_raw[0]:.1f}")
 
         # ── Phase 2: Denoise raw frames ───────────────────────────────────────
         print("Denoising...")
@@ -507,6 +511,15 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused; gc.collect()
 
+        # Post-fusion: CLAHE on L-channel to lift dark interior corners
+        # (same technique as reference pipeline — brightens shadows without blowing windows)
+        print("Applying CLAHE to Mertens base...")
+        lab = cv2.cvtColor(mertens_base, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        mertens_base = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
         # ── Phase 3i-j: Start from Mertens, boost dark interior zones ─────────
         print("Interior composite...")
         mertens_f = mertens_base.astype(np.float32) / 255.0
@@ -521,25 +534,42 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         interior_f = mertens_f + dark_interior_mask * (bright_f - mertens_f)
         interior_f = np.clip(interior_f, 0, 1)
 
-        # ── Phase 3k: Window composite from best raw window frame ─────────────
+        # ── Phase 3k: Window pull — mask from interior result, source from dark frame ─
         print("Window composite...")
-        # Use dark frame — minimal lift to keep exterior trees/sky detail visible
-        win_frame_normed = normalise_to_target(best_window_frame, target_mean=50.0)
+        # Lift dark frame enough to show bright exterior (trees, sky, street visible)
+        # Target ~80 gives a naturally lit exterior without blowing it out
+        win_frame_normed = normalise_to_target(best_window_frame, target_mean=80.0)
         win_frame_f      = win_frame_normed.astype(np.float32) / 255.0
 
-        # Hard composite: window zones get raw dark frame data (exterior detail)
-        composited_f = interior_f * (1.0 - win_mask3) + win_frame_f * win_mask3
+        # PRIMARY MASK: detect blown windows on the INTERIOR composite result
+        # (mirrors the reference algorithm: threshold 240/255 = 0.94 on bright image)
+        lum_interior = (0.299 * interior_f[:, :, 2] +
+                        0.587 * interior_f[:, :, 1] +
+                        0.114 * interior_f[:, :, 0])
+
+        # Hard threshold at 0.88 on the merged interior (slightly lower than 0.94
+        # since our interior is already tone-mapped, not raw bright)
+        blown_hard = (lum_interior > 0.88).astype(np.uint8) * 255
+        # Morphological close to fill gaps between window panes / mullions
+        close_k    = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+        blown_hard = cv2.morphologyEx(blown_hard, cv2.MORPH_CLOSE, close_k)
+        # Dilate outward to cover bright spill on sills and frames
+        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+        blown_hard = cv2.dilate(blown_hard, dilate_k)
+        # Smooth edges for natural blend (reference uses GaussianBlur (21,21))
+        blown_mask = cv2.GaussianBlur(blown_hard.astype(np.float32) / 255.0,
+                                      (41, 41), 0)
+        blown_mask = np.clip(blown_mask, 0, 1)[:, :, np.newaxis]
+
+        # SECONDARY MASK: union with pre-computed dark-frame window mask
+        # so we also catch zones the interior mask might miss (e.g. curtain spill)
+        combined_mask = np.clip(blown_mask + win_mask3 * 0.5, 0, 1)
+
+        # Blend: blown/window zones → exterior dark frame; room → interior
+        composited_f = interior_f * (1.0 - combined_mask) + win_frame_f * combined_mask
         composited_f = np.clip(composited_f, 0, 1)
 
-        # Spill blend: near-window hot spots pulled toward window frame
-        # Lower threshold (0.75) to catch more overexposed spill near window edges
-        lum_int    = 0.299 * interior_f[:, :, 2] + 0.587 * interior_f[:, :, 1] + 0.114 * interior_f[:, :, 0]
-        spill_mask = np.clip((lum_int - 0.75) / (1.0 - 0.75 + 1e-6), 0, 1) ** 2.0
-        spill_mask = spill_mask * (1.0 - win_mask)
-        spill_mask = cv2.GaussianBlur(spill_mask.astype(np.float32), (0, 0), 8, 8)
-        spill_mask = np.clip(spill_mask, 0, 0.75)[:, :, np.newaxis]
-        composited_f = composited_f * (1.0 - spill_mask * 0.6) + win_frame_f * (spill_mask * 0.6)
-        composited_f = np.clip(composited_f, 0, 1)
+        print(f"  Window pull: {blown_mask.mean()*100:.1f}% of image replaced")
 
         composited = np.clip(composited_f * 255, 0, 255).astype(np.uint8)
         del mertens_f, bright_f, win_frame_f, composited_f, win_mask3, mertens_base
