@@ -219,45 +219,44 @@ def build_geometric_window_candidates(segments: np.ndarray, h: int, w: int,
     return geom_mask
 
 
-def build_geometric_window_candidates_v2(ambient_bgr: np.ndarray, darkest_bgr: np.ndarray) -> np.ndarray:
+def differential_window_mask(ambient_bgr: np.ndarray, darkest_bgr: np.ndarray) -> np.ndarray:
     """
-    Replaces the nested-loop LSD cluster search.
-    Uses luminance-differential thresholding + connected components to isolate
-    true architectural window openings without combinatorial blind spots.
+    Detects windows by measuring the absolute pixel DROP between the bright ambient
+    frame and the darkest bracket. Window panes drop 130+ levels; interior walls
+    drop minimally — this mathematically separates them even when walls are white/glaring.
     """
     h, w = ambient_bgr.shape[:2]
-    gray_ambient = cv2.cvtColor(ambient_bgr, cv2.COLOR_BGR2GRAY)
-    gray_darkest = cv2.cvtColor(darkest_bgr, cv2.COLOR_BGR2GRAY)
+    gray_ambient = cv2.cvtColor(ambient_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    gray_darkest = cv2.cvtColor(darkest_bgr, cv2.COLOR_BGR2GRAY).astype(np.int16)
 
-    # Blown zones in the bright/ambient frame = window candidates
-    _, bright_seed = cv2.threshold(gray_ambient, 220, 255, cv2.THRESH_BINARY)
+    # How much did each pixel drop? Windows drop massively; walls drop uniformly.
+    pixel_delta = np.clip(gray_ambient - gray_darkest, 0, 255).astype(np.uint8)
 
-    # Dark frame: walls are pitch-black, windows are midtone — exclude dead-black pixels
-    _, dark_wall_mask = cv2.threshold(gray_darkest, 15, 255, cv2.THRESH_BINARY_INV)
+    # Pixels that dropped >120 levels are architectural openings
+    _, window_zones = cv2.threshold(pixel_delta, 120, 255, cv2.THRESH_BINARY)
 
-    # Intersect: true windows must be blown in bright AND not pitch-black in dark
-    validated_seeds = cv2.bitwise_and(bright_seed, cv2.bitwise_not(dark_wall_mask))
-
-    # Morphological close to fuse window panes across mullions/frames — scales with image size
-    kernel_size = max(int(max(h, w) * 0.02), 3)
+    # Connect panes across mullions — kernel scales with image size
+    kernel_size = max(int(max(h, w) * 0.015), 3)
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    closed_mask = cv2.morphologyEx(validated_seeds, cv2.MORPH_CLOSE, kernel)
+    closed_mask = cv2.morphologyEx(window_zones, cv2.MORPH_CLOSE, kernel)
 
-    # Connected components: filter out tiny reflections (TV, mirrors) and full-image blobs
+    # Connected components — remove tiny TV/mirror reflections and full-frame blobs
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed_mask, connectivity=8)
     geom_mask = np.zeros((h, w), dtype=np.uint8)
-    min_area = int((h * w) * 0.005)   # 0.5% min — real window
-    max_area = int((h * w) * 0.60)    # 60% max — not the whole image
+    min_area = int((h * w) * 0.005)
+    max_area = int((h * w) * 0.60)
 
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
         if min_area <= area <= max_area:
             geom_mask[labels == i] = 255
-            print(f"    Window component {i}: area={area} px ({area/(h*w)*100:.1f}%)")
+            print(f"    Delta window component {i}: area={area} px ({area/(h*w)*100:.1f}%)")
 
-    return geom_mask.astype(np.float32) / 255.0
+    # Feather edges for clean blending
+    feathered = cv2.GaussianBlur(geom_mask.astype(np.float32), (21, 21), 0)
+    return np.clip(feathered / 255.0, 0, 1)
 
 
 def build_window_mask_from_raw(dark_raw: np.ndarray, bright_raw: np.ndarray, sigma: float = 12.0) -> np.ndarray:
@@ -301,11 +300,12 @@ def build_window_mask_from_raw(dark_raw: np.ndarray, bright_raw: np.ndarray, sig
     spill = np.clip((lum - 0.60) / (1.0 - 0.60 + 1e-6), 0, 1) ** 1.2
     photo_combined = np.clip(photo_mask + spill * 0.7, 0, 1)
 
-    # ── Phase B: Geometric mask (connected components) ───────────────────────
-    print("  Running connected-components window detection...")
-    geom_mask = build_geometric_window_candidates_v2(bright_raw, dark_raw)
-    geom_mask_blurred = cv2.GaussianBlur(geom_mask, (0, 0), 6, 6)
-    combined = np.clip(photo_combined + geom_mask_blurred, 0, 1)
+    # ── Phase B: Differential delta mask ─────────────────────────────────────
+    # Pixel drop between bright and dark frames isolates true window panes
+    # even when walls are white/glaring (the old brightness threshold failure mode)
+    print("  Running differential delta window detection...")
+    delta_mask = differential_window_mask(bright_raw, dark_raw)
+    combined = np.clip(photo_combined + delta_mask, 0, 1)
 
     # Final feather pass
     combined = cv2.GaussianBlur(combined.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -387,6 +387,27 @@ def apply_tone_curve(img_f: np.ndarray, curve_in: List[float], curve_out: List[f
 # ---------------------------------------------------------------------------
 # Large-radius unsharp mask on L-channel (3D pop, no grain)
 # ---------------------------------------------------------------------------
+
+def neutralize_yellow_cast(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Fixes yellow ceiling/wall cast using LAB b-channel pull on bright areas.
+    Keeps floor/lamp warmth intact while pushing ceilings toward clean neutral white.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+
+    # Bright areas (L > 200/255 ≈ 0.78) are ceilings and walls
+    bright_w = np.clip((l - 180.0) / 40.0, 0, 1)
+
+    # Pull b-channel toward 128 (neutral) in bright zones — removes yellow without touching floors
+    b_neutral = b * (1.0 - bright_w * 0.55) + 128.0 * (bright_w * 0.55)
+    # Also pull a-channel slightly toward neutral to kill green-yellow
+    a_neutral = a * (1.0 - bright_w * 0.25) + 128.0 * (bright_w * 0.25)
+
+    lab[:, :, 1] = np.clip(a_neutral, 0, 255)
+    lab[:, :, 2] = np.clip(b_neutral, 0, 255)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
 
 def local_contrast_enhance(img_bgr: np.ndarray, radius: float = 45.0, amount: float = 0.20) -> np.ndarray:
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -520,13 +541,14 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
         del fused; gc.collect()
 
-        # Post-fusion: very mild CLAHE — just enough to lift dark corners without halos
-        print("Applying CLAHE to Mertens base...")
+        # Post-fusion: mild CLAHE + yellow cast neutralization on bright zones
+        print("Applying CLAHE + yellow neutralization to Mertens base...")
         lab = cv2.cvtColor(mertens_base, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=0.4, tileGridSize=(32, 32))
         l = clahe.apply(l)
         mertens_base = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+        mertens_base = neutralize_yellow_cast(mertens_base)
 
         # ── Phase 3i-j: Start from Mertens, boost dark interior zones ─────────
         print("Interior composite...")
@@ -542,36 +564,22 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         interior_f = mertens_f + dark_interior_mask * (bright_f - mertens_f)
         interior_f = np.clip(interior_f, 0, 1)
 
-        # ── Phase 3k: Window pull — mask from interior result, source from dark frame ─
-        print("Window composite...")
-        # Lift dark frame enough to show bright exterior (trees, sky, street visible)
-        # Target ~80 gives a naturally lit exterior without blowing it out
+        # ── Phase 3k: Window pull — differential mask drives compositing ─────
+        print("Window composite (delta mask)...")
         win_frame_normed = normalise_to_target(best_window_frame, target_mean=80.0)
         win_frame_f      = win_frame_normed.astype(np.float32) / 255.0
 
-        # PRIMARY MASK: detect blown windows on the INTERIOR composite result
-        # (mirrors the reference algorithm: threshold 240/255 = 0.94 on bright image)
+        # Use the pre-computed delta mask (exposure differential) as primary driver.
+        # win_mask3 was built from the same delta approach — use it directly.
+        # Add a small blown-pixel safety net for any zones the delta missed.
         lum_interior = (0.299 * interior_f[:, :, 2] +
                         0.587 * interior_f[:, :, 1] +
                         0.114 * interior_f[:, :, 0])
+        blown_safety = np.clip((lum_interior - 0.90) / 0.10, 0, 1)  # only truly blown (>0.90)
+        blown_safety = cv2.GaussianBlur(blown_safety.astype(np.float32), (21, 21), 0)
 
-        # Threshold at 0.85 — catch more blown window zones to reveal exterior detail
-        blown_hard = (lum_interior > 0.85).astype(np.uint8) * 255
-        # Small close to fill mullion gaps only — don't bleed onto curtains/couch
-        close_k    = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        blown_hard = cv2.morphologyEx(blown_hard, cv2.MORPH_CLOSE, close_k)
-        # More aggressive dilation — pulls exterior detail further into frames
-        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        blown_hard = cv2.dilate(blown_hard, dilate_k)
-        # Smooth edges
-        blown_mask = cv2.GaussianBlur(blown_hard.astype(np.float32) / 255.0,
-                                      (21, 21), 0)
-        blown_mask = np.clip(blown_mask, 0, 1)[:, :, np.newaxis]
-
-        # Intersection: both blown_mask AND win_mask must agree — prevents
-        # white painted frames from being darkened by the window pull
-        combined_mask = blown_mask * np.clip(win_mask3 * 4, 0, 1)
-        combined_mask = np.clip(combined_mask + win_mask3 * 0.15, 0, 1)
+        # Primary: delta mask. Secondary: tiny safety net. No wall-glare bleed.
+        combined_mask = np.clip(win_mask3 + blown_safety[:, :, np.newaxis] * 0.3, 0, 1)
 
         # Blend: blown/window zones → exterior dark frame; room → interior
         composited_f = interior_f * (1.0 - combined_mask) + win_frame_f * combined_mask
@@ -632,8 +640,8 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     interior3    = 1.0 - win_protect3
 
     # ── 1. Gamma lift — aggressive to match bright target ────────────────────
-    # gamma=0.42 → strong lift, pushing mid-tones from muddy dark to bright beige
-    gamma = 0.42
+    # gamma=0.38 → stronger lift to match well-exposed target brightness
+    gamma = 0.38
     img_interior = np.clip(np.power(np.clip(img, 0, 1), gamma), 0, 1)
     img = img_interior * interior3 + img * win_protect3
     img = np.clip(img, 0, 1)
@@ -687,18 +695,32 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     img = img + wall_mask3 * 0.08 * (1.0 - img)
     img = np.clip(img, 0, 1)
 
-    # ── 5. Shadow fill — stronger to lift dark left-side corners ─────────────
-    # fill_cutoff=0.38 (was 0.28), fill_strength=0.32 (was 0.40 but capped lower)
+    # ── 5. Shadow fill — lift dark corners aggressively ──────────────────────
     lum3       = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask  = np.clip(1.0 - lum3 / 0.38, 0, 1) ** 1.5   # wider cutoff catches more shadow
+    fill_mask  = np.clip(1.0 - lum3 / 0.45, 0, 1) ** 1.3   # wider cutoff, softer curve
     fill_mask3 = fill_mask[:, :, np.newaxis]
-    img = img + fill_mask3 * 0.32 * (1.0 - img) * interior3  # controlled strength
+    img = img + fill_mask3 * 0.40 * (1.0 - img) * interior3  # stronger fill
     img = np.clip(img, 0, 1)
 
-    # ── 6. Colour grade — R+4%, G+1%, B-7% to remove yellow-green, add warmth ─
-    img[:, :, 2] = np.clip(img[:, :, 2] * 1.04, 0, 1)  # R up
+    # ── 5b. Ceiling whitening — desaturate + brighten very high-lum interior zones
+    lum_ceil  = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
+    ceil_mask = np.clip((lum_ceil - 0.70) / (1.0 - 0.70 + 1e-6), 0, 1) ** 1.5
+    ceil_mask = ceil_mask * (1.0 - win_protect)  # skip windows
+    ceil_mask = cv2.GaussianBlur(ceil_mask.astype(np.float32), (0, 0), 15, 15)
+    ceil_mask = np.clip(ceil_mask, 0, 1)
+    # Desaturate (remove tan cast)
+    img_u8_ceil = (img * 255).astype(np.uint8)
+    hsv_ceil = cv2.cvtColor(img_u8_ceil, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv_ceil[:, :, 1] = hsv_ceil[:, :, 1] * (1.0 - ceil_mask * 0.80)  # heavy desat
+    img = cv2.cvtColor(np.clip(hsv_ceil, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
+    # Brightness push toward white
+    img = img + ceil_mask[:, :, np.newaxis] * 0.10 * (1.0 - img)
+    img = np.clip(img, 0, 1)
+
+    # ── 6. Colour grade — R+5%, G+1%, B-7% warm beige tone ───────────────────
+    img[:, :, 2] = np.clip(img[:, :, 2] * 1.05, 0, 1)  # R up — warm
     img[:, :, 1] = np.clip(img[:, :, 1] * 1.01, 0, 1)  # G neutral
-    img[:, :, 0] = np.clip(img[:, :, 0] * 0.93, 0, 1)  # B down — kills yellow-green cast
+    img[:, :, 0] = np.clip(img[:, :, 0] * 0.93, 0, 1)  # B down — remove cool cast
 
     # ── 7. Vibrance (18 units — moderate, interior surfaces only) ─────────────
     img_u8 = (img * 255).astype(np.uint8)
