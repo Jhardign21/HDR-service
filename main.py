@@ -219,7 +219,48 @@ def build_geometric_window_candidates(segments: np.ndarray, h: int, w: int,
     return geom_mask
 
 
-def build_window_mask_from_raw(dark_raw: np.ndarray, sigma: float = 12.0) -> np.ndarray:
+def build_geometric_window_candidates_v2(ambient_bgr: np.ndarray, darkest_bgr: np.ndarray) -> np.ndarray:
+    """
+    Replaces the nested-loop LSD cluster search.
+    Uses luminance-differential thresholding + connected components to isolate
+    true architectural window openings without combinatorial blind spots.
+    """
+    h, w = ambient_bgr.shape[:2]
+    gray_ambient = cv2.cvtColor(ambient_bgr, cv2.COLOR_BGR2GRAY)
+    gray_darkest = cv2.cvtColor(darkest_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Blown zones in the bright/ambient frame = window candidates
+    _, bright_seed = cv2.threshold(gray_ambient, 220, 255, cv2.THRESH_BINARY)
+
+    # Dark frame: walls are pitch-black, windows are midtone — exclude dead-black pixels
+    _, dark_wall_mask = cv2.threshold(gray_darkest, 15, 255, cv2.THRESH_BINARY_INV)
+
+    # Intersect: true windows must be blown in bright AND not pitch-black in dark
+    validated_seeds = cv2.bitwise_and(bright_seed, cv2.bitwise_not(dark_wall_mask))
+
+    # Morphological close to fuse window panes across mullions/frames — scales with image size
+    kernel_size = max(int(max(h, w) * 0.02), 3)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    closed_mask = cv2.morphologyEx(validated_seeds, cv2.MORPH_CLOSE, kernel)
+
+    # Connected components: filter out tiny reflections (TV, mirrors) and full-image blobs
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed_mask, connectivity=8)
+    geom_mask = np.zeros((h, w), dtype=np.uint8)
+    min_area = int((h * w) * 0.005)   # 0.5% min — real window
+    max_area = int((h * w) * 0.60)    # 60% max — not the whole image
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if min_area <= area <= max_area:
+            geom_mask[labels == i] = 255
+            print(f"    Window component {i}: area={area} px ({area/(h*w)*100:.1f}%)")
+
+    return geom_mask.astype(np.float32) / 255.0
+
+
+def build_window_mask_from_raw(dark_raw: np.ndarray, bright_raw: np.ndarray, sigma: float = 12.0) -> np.ndarray:
     """
     Hybrid geometric + photometric window mask, inspired by Autoenhance's M-LSD approach.
 
@@ -260,44 +301,11 @@ def build_window_mask_from_raw(dark_raw: np.ndarray, sigma: float = 12.0) -> np.
     spill = np.clip((lum - 0.60) / (1.0 - 0.60 + 1e-6), 0, 1) ** 1.2
     photo_combined = np.clip(photo_mask + spill * 0.7, 0, 1)
 
-    # ── Phase B: Geometric mask (LSD) ────────────────────────────────────────
-    print("  Running LSD line detection for geometric window candidates...")
-    gray    = cv2.cvtColor(dark_raw, cv2.COLOR_BGR2GRAY)
-
-    # Enhance contrast before LSD so window frames are more visible
-    # Use CLAHE — same as what Autoenhance does for their detection preprocessing
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray)
-
-    segments = detect_line_segments(gray_eq)
-
-    if segments is not None:
-        print(f"  LSD found {len(segments)} line segments")
-        # Build a soft coverage map from all H/V segments (shows wall structure)
-        h_segs, v_segs = classify_segments(segments)
-        print(f"  H-segments: {len(h_segs)}, V-segments: {len(v_segs)}")
-
-        # Geometric window rectangle candidates (cross-checked with brightness)
-        geom_mask = build_geometric_window_candidates(segments, h, w, photo_mask)
-
-        # Also build soft line-coverage heatmap near bright regions
-        # — this catches window mullions that interrupted the photometric mask
-        all_hv = np.vstack([h_segs, v_segs]) if len(h_segs) > 0 and len(v_segs) > 0 else segments
-        line_cov = segments_to_coverage_map(all_hv, h, w, thickness=6)
-        line_cov = cv2.GaussianBlur(line_cov, (0, 0), 4, 4)
-        line_cov = np.clip(line_cov, 0, 1)
-
-        # Line coverage only contributes inside or near the photometric bright zone
-        # — prevents wall edges far from windows from bleeding into the mask
-        bright_dilated = cv2.dilate(photo_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (60, 60)))
-        line_near_window = line_cov * bright_dilated * 0.3
-
-        # Combine: photometric soft + geometric hard + line-fill
-        geom_mask_blurred = cv2.GaussianBlur(geom_mask, (0, 0), 6, 6)
-        combined = np.clip(photo_combined + geom_mask_blurred + line_near_window, 0, 1)
-    else:
-        print("  No line segments detected, using photometric mask only")
-        combined = photo_combined
+    # ── Phase B: Geometric mask (connected components) ───────────────────────
+    print("  Running connected-components window detection...")
+    geom_mask = build_geometric_window_candidates_v2(bright_raw, dark_raw)
+    geom_mask_blurred = cv2.GaussianBlur(geom_mask, (0, 0), 6, 6)
+    combined = np.clip(photo_combined + geom_mask_blurred, 0, 1)
 
     # Final feather pass
     combined = cv2.GaussianBlur(combined.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -452,8 +460,8 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         # LSD geometric layer catches windows that aren't fully blown out
         # (overcast days, curtained windows, windows at angle) where the
         # pure brightness threshold misses them.
-        print("Building hybrid LSD + photometric window mask from raw dark frame...")
-        win_mask  = build_window_mask_from_raw(raw_dark_frame, sigma=18.0)
+        print("Building hybrid connected-components + photometric window mask...")
+        win_mask  = build_window_mask_from_raw(raw_dark_frame, raw_bright_frame, sigma=18.0)
         win_mask3 = win_mask[:, :, np.newaxis]
         interior3 = 1.0 - win_mask3
 
@@ -547,13 +555,13 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
                         0.587 * interior_f[:, :, 1] +
                         0.114 * interior_f[:, :, 0])
 
-        # Threshold at 0.92 — only truly blown pixels, not bright walls/ceiling
-        blown_hard = (lum_interior > 0.92).astype(np.uint8) * 255
+        # Threshold at 0.85 — catch more blown window zones to reveal exterior detail
+        blown_hard = (lum_interior > 0.85).astype(np.uint8) * 255
         # Small close to fill mullion gaps only — don't bleed onto curtains/couch
         close_k    = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         blown_hard = cv2.morphologyEx(blown_hard, cv2.MORPH_CLOSE, close_k)
-        # Minimal dilation — just enough to cover window sill, not furniture
-        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8))
+        # More aggressive dilation — pulls exterior detail further into frames
+        dilate_k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         blown_hard = cv2.dilate(blown_hard, dilate_k)
         # Smooth edges
         blown_mask = cv2.GaussianBlur(blown_hard.astype(np.float32) / 255.0,
