@@ -553,23 +553,29 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
 def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Finish pass — input is properly exposed with correct window zones.
+    Finish pass — tuned to match target: bright neutral beige tones, strong
+    shadow fill on dark sides, controlled window highlights, no yellow-green cast.
+
+    Parameters calibrated by AI diff analysis against target reference:
+      gamma=0.42, highlight_start=0.72, fill_cutoff=0.38, fill_strength=0.32
+      r_mult=1.04, g_mult=1.01, b_mult=0.93, vibrance=18, sharpen=0.55/1.2r
 
     Steps:
-      1. Gentle S-curve: lift shadows, protect highlights
-      2. Large-radius USM on L-channel: 3D depth pop, zero grain
-      3. Wall/ceiling zone: desaturate, grey-world cast removal, brightness push
-      4. Shadow fill for residual dark corners
-      5. Colour grade (neutral warm 5500K)
-      6. Vibrance
-      7. Sharpening
+      1. Gamma lift (aggressive — interior was too dark overall)
+      2. Highlight rolloff (starts at 0.72 — earlier than before to control windows)
+      3. Large-radius USM on L-channel: 3D depth pop, no grain
+      4. Wall/ceiling zone: desaturate + cast removal (removes yellow-green cast)
+      5. Shadow fill — stronger cutoff (0.38) and fill (0.32) for dark corners
+      6. Colour grade: R+4%, G+1%, B-7% — eliminates yellow-green cast globally
+      7. Vibrance (18 units)
+      8. Sharpening (0.55 amount, 1.2px radius)
     """
     img = img_bgr.astype(np.float32) / 255.0
 
     # ── Window protect mask ───────────────────────────────────────────────────
     lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     b_chan, g_chan, r_chan = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-    lum_win  = np.clip((lum_raw - 0.82) / (1.0 - 0.82 + 1e-6), 0, 1) ** 1.5
+    lum_win  = np.clip((lum_raw - 0.72) / (1.0 - 0.72 + 1e-6), 0, 1) ** 1.5  # earlier rolloff at 0.72
     blue_dom = np.clip((b_chan - np.maximum(r_chan, g_chan) + 0.05) / 0.12, 0, 1)
     blue_dom = blue_dom * (lum_raw > 0.50).astype(np.float32)
     win_raw      = np.clip(lum_win * 0.7 + blue_dom * 0.3, 0, 1)
@@ -578,19 +584,35 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     win_protect3 = win_protect[:, :, np.newaxis]
     interior3    = 1.0 - win_protect3
 
-    # ── 1. S-curve (interior only) ────────────────────────────────────────────
-    SCURVE_IN  = [0.0, 0.08, 0.25, 0.50, 0.75, 0.92, 1.0]
-    SCURVE_OUT = [0.0, 0.13, 0.32, 0.56, 0.76, 0.93, 1.0]
-    img_curved = apply_tone_curve(img, SCURVE_IN, SCURVE_OUT)
-    img = img_curved * interior3 + img * win_protect3
+    # ── 1. Gamma lift — aggressive to match bright target ────────────────────
+    # gamma=0.42 → strong lift, pushing mid-tones from muddy dark to bright beige
+    gamma = 0.42
+    img_interior = np.clip(np.power(np.clip(img, 0, 1), gamma), 0, 1)
+    img = img_interior * interior3 + img * win_protect3
     img = np.clip(img, 0, 1)
 
-    # ── 2. Large-radius USM on L-channel ─────────────────────────────────────
+    # ── 2. Highlight rolloff (interior only, protect windows) ────────────────
+    # Rolls off highlights starting at 0.72 to cap bright walls at 0.88
+    # This prevents the white ceiling/walls from blowing while interior is bright
+    highlight_start  = 0.72
+    highlight_cap    = 0.88
+    highlight_str    = 0.65
+    lum_h = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
+    hl_mask = np.clip((lum_h - highlight_start) / (1.0 - highlight_start + 1e-6), 0, 1) ** 1.5
+    hl_mask = hl_mask * interior3[:, :, 0]
+    hl_mask3 = hl_mask[:, :, np.newaxis]
+    # Blend toward highlight_cap in blown zones
+    target_hl = img * (highlight_cap / (lum_h[:, :, np.newaxis] + 1e-6))
+    target_hl = np.clip(target_hl, 0, 1)
+    img = img * (1.0 - hl_mask3 * highlight_str) + target_hl * (hl_mask3 * highlight_str)
+    img = np.clip(img, 0, 1)
+
+    # ── 3. Large-radius USM on L-channel ─────────────────────────────────────
     img_u8 = (img * 255).astype(np.uint8)
     img_u8 = local_contrast_enhance(img_u8, radius=45.0, amount=0.20)
     img    = img_u8.astype(np.float32) / 255.0
 
-    # ── 3. Wall/ceiling zone ──────────────────────────────────────────────────
+    # ── 4. Wall/ceiling zone — desaturate + cast removal ─────────────────────
     lum2 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
     wall_mask = np.clip((lum2 - 0.30) / (0.95 - 0.30), 0, 1)
     wall_mask = wall_mask * (1.0 - win_protect)
@@ -598,53 +620,54 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     wall_mask = np.clip(wall_mask, 0, 1)
     wall_mask3 = wall_mask[:, :, np.newaxis]
 
-    # Desaturate walls
+    # Stronger desaturation on walls to remove yellow-green cast
     img_u8_tmp = (img * 255).astype(np.uint8)
     hsv_tmp = cv2.cvtColor(img_u8_tmp, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * 0.45)
+    hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * 0.55)  # was 0.45
     img = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # Grey-world cast removal (±8% cap)
+    # Grey-world cast removal (±10% cap — wider to fix yellow-green cast)
     wall_sum = wall_mask.sum() + 1e-6
     mean_r   = (img[:, :, 2] * wall_mask).sum() / wall_sum
     mean_g   = (img[:, :, 1] * wall_mask).sum() / wall_sum
     mean_b   = (img[:, :, 0] * wall_mask).sum() / wall_sum
     mean_all = (mean_r + mean_g + mean_b) / 3.0 + 1e-6
     for ch, mean_ch in [(2, mean_r), (1, mean_g), (0, mean_b)]:
-        cor = np.clip(mean_all / (mean_ch + 1e-6), 0.92, 1.08)
-        img[:, :, ch] = np.clip(img[:, :, ch] * (1.0 + (cor - 1.0) * wall_mask * 0.25), 0, 1)
+        cor = np.clip(mean_all / (mean_ch + 1e-6), 0.90, 1.10)  # was 0.92/1.08
+        img[:, :, ch] = np.clip(img[:, :, ch] * (1.0 + (cor - 1.0) * wall_mask * 0.35), 0, 1)  # was 0.25
 
     # Brightness push on walls
     img = img + wall_mask3 * 0.08 * (1.0 - img)
     img = np.clip(img, 0, 1)
 
-    # ── 4. Shadow fill (deep corners only) ───────────────────────────────────
+    # ── 5. Shadow fill — stronger to lift dark left-side corners ─────────────
+    # fill_cutoff=0.38 (was 0.28), fill_strength=0.32 (was 0.40 but capped lower)
     lum3       = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask  = np.clip(1.0 - lum3 / 0.28, 0, 1) ** 1.5
+    fill_mask  = np.clip(1.0 - lum3 / 0.38, 0, 1) ** 1.5   # wider cutoff catches more shadow
     fill_mask3 = fill_mask[:, :, np.newaxis]
-    img = img + fill_mask3 * 0.40 * (1.0 - img) * interior3
+    img = img + fill_mask3 * 0.32 * (1.0 - img) * interior3  # controlled strength
     img = np.clip(img, 0, 1)
 
-    # ── 5. Colour grade (neutral 5500K) ──────────────────────────────────────
-    img[:, :, 2] = np.clip(img[:, :, 2] * 1.00, 0, 1)
-    img[:, :, 1] = np.clip(img[:, :, 1] * 1.00, 0, 1)
-    img[:, :, 0] = np.clip(img[:, :, 0] * 0.97, 0, 1)
+    # ── 6. Colour grade — R+4%, G+1%, B-7% to remove yellow-green, add warmth ─
+    img[:, :, 2] = np.clip(img[:, :, 2] * 1.04, 0, 1)  # R up
+    img[:, :, 1] = np.clip(img[:, :, 1] * 1.01, 0, 1)  # G neutral
+    img[:, :, 0] = np.clip(img[:, :, 0] * 0.93, 0, 1)  # B down — kills yellow-green cast
 
-    # ── 6. Vibrance ───────────────────────────────────────────────────────────
+    # ── 7. Vibrance (18 units — moderate, interior surfaces only) ─────────────
     img_u8 = (img * 255).astype(np.uint8)
     hsv    = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
     sat_n  = hsv[:, :, 1] / 255.0
     vib_zone  = np.clip(1.0 - wall_mask, 0, 1)
-    vib_boost = 12.0 * (1.0 - sat_n) ** 1.5 * vib_zone
+    vib_boost = 18.0 * (1.0 - sat_n) ** 1.5 * vib_zone  # was 12
     hsv[:, :, 1] = np.clip(hsv[:, :, 1] + vib_boost, 0, 255)
     img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
-    # ── 7. Sharpening ─────────────────────────────────────────────────────────
+    # ── 8. Sharpening (0.55 amount, 1.2px radius) ────────────────────────────
     img_u8    = (img * 255).astype(np.uint8)
     pil_img   = Image.fromarray(cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB))
-    blurred   = pil_img.filter(ImageFilter.GaussianBlur(radius=0.8))
+    blurred   = pil_img.filter(ImageFilter.GaussianBlur(radius=1.2))  # was 0.8
     sharpened = np.clip(
-        np.array(pil_img).astype(np.float32) + 0.45 * (
+        np.array(pil_img).astype(np.float32) + 0.55 * (   # was 0.45
             np.array(pil_img).astype(np.float32) - np.array(blurred).astype(np.float32)
         ), 0, 255
     ).astype(np.uint8)
