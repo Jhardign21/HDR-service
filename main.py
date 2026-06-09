@@ -240,21 +240,25 @@ def build_window_mask_from_raw(dark_raw: np.ndarray, sigma: float = 12.0) -> np.
     lum  = 0.299 * f[:, :, 2] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 0]
 
     # ── Phase A: Photometric mask ─────────────────────────────────────────────
-    # Lower threshold to 0.65 to catch windows not fully blown on dark frame
-    hard_thresh = (lum > 0.65).astype(np.uint8) * 255
-    kernel      = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+    # Threshold 0.55 — aggressively catch all bright window zones on dark frame
+    hard_thresh = (lum > 0.55).astype(np.uint8) * 255
+    # Large morphological close to fill window frame gaps and sill spill
+    kernel      = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
     hard_closed = cv2.morphologyEx(hard_thresh, cv2.MORPH_CLOSE, kernel)
+    # Also dilate to extend mask beyond the raw bright zone (catches frame edges)
+    dilate_k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    hard_closed = cv2.dilate(hard_closed, dilate_k)
     contours, _ = cv2.findContours(hard_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     photo_mask  = np.zeros((h, w), dtype=np.float32)
-    min_window_area = (h * w) * 0.003  # slightly smaller min area to catch all panes
+    min_window_area = (h * w) * 0.002
 
     for cnt in contours:
         if cv2.contourArea(cnt) >= min_window_area:
             cv2.drawContours(photo_mask, [cnt], -1, 1.0, thickness=cv2.FILLED)
 
-    # Soft spill around bright zones
-    spill = np.clip((lum - 0.75) / (1.0 - 0.75 + 1e-6), 0, 1) ** 1.5
-    photo_combined = np.clip(photo_mask + spill * 0.6, 0, 1)
+    # Generous soft spill around bright zones to pull in frame/sill regions
+    spill = np.clip((lum - 0.60) / (1.0 - 0.60 + 1e-6), 0, 1) ** 1.2
+    photo_combined = np.clip(photo_mask + spill * 0.7, 0, 1)
 
     # ── Phase B: Geometric mask (LSD) ────────────────────────────────────────
     print("  Running LSD line detection for geometric window candidates...")
@@ -449,7 +453,7 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         # (overcast days, curtained windows, windows at angle) where the
         # pure brightness threshold misses them.
         print("Building hybrid LSD + photometric window mask from raw dark frame...")
-        win_mask  = build_window_mask_from_raw(raw_dark_frame, sigma=12.0)
+        win_mask  = build_window_mask_from_raw(raw_dark_frame, sigma=18.0)
         win_mask3 = win_mask[:, :, np.newaxis]
         interior3 = 1.0 - win_mask3
 
@@ -519,9 +523,8 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
         # ── Phase 3k: Window composite from best raw window frame ─────────────
         print("Window composite...")
-        # Use dark frame as-is (no normalisation) to preserve exterior detail
-        # Just a gentle exposure lift to make exterior visible but not blown
-        win_frame_normed = normalise_to_target(best_window_frame, target_mean=65.0)
+        # Use dark frame — minimal lift to keep exterior trees/sky detail visible
+        win_frame_normed = normalise_to_target(best_window_frame, target_mean=50.0)
         win_frame_f      = win_frame_normed.astype(np.float32) / 255.0
 
         # Hard composite: window zones get raw dark frame data (exterior detail)
