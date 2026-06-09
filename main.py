@@ -415,30 +415,33 @@ def correct_vertical_perspective(img: np.ndarray) -> np.ndarray:
     small rotation to straighten leaning verticals. Safe — only fires
     when ≥5 near-vertical lines agree and tilt > 0.1°.
     """
-    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
-                            minLineLength=150, maxLineGap=10)
-    if lines is None:
+    try:
+        gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                                minLineLength=150, maxLineGap=10)
+        if lines is None or len(lines) == 0:
+            return img
+        angles = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if abs(x1 - x2) < 15:   # near-vertical segment
+                angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+                angles.append(angle)
+        if len(angles) < 5:
+            return img
+        median_angle = float(np.median(angles))
+        tilt = median_angle - 90.0 if median_angle > 0 else median_angle + 90.0
+        if abs(tilt) < 0.1:
+            return img
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), tilt, 1.0)
+        return cv2.warpAffine(img, M, (w, h),
+                              flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE)
+    except Exception as e:
+        print(f"  Perspective correction skipped: {e}")
         return img
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if abs(x1 - x2) < 15:   # near-vertical segment
-            angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
-            angles.append(angle)
-    if len(angles) < 5:
-        return img
-    median_angle = float(np.median(angles))
-    tilt = median_angle - 90.0 if median_angle > 0 else median_angle + 90.0
-    if abs(tilt) < 0.1:
-        return img
-    h, w = img.shape[:2]
-    print(f"  Perspective correction: tilt={tilt:.2f}°")
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), tilt, 1.0)
-    return cv2.warpAffine(img, M, (w, h),
-                          flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_REPLICATE)
 
 
 def anchor_ambient_shadows(img: np.ndarray) -> np.ndarray:
@@ -836,3 +839,29 @@ async def merge_hdr(req: MergeRequest):
         raise HTTPException(400, "No file URLs provided")
     if len(req.file_urls) not in (1, 3, 5):
         raise HTTPException(400, f"Expected 1, 3, or 5 files, got {len(req.file_urls)}")
+    try:
+        print(f"Starting HDR merge for '{req.bracket_name}' ({len(req.file_urls)} frames)...")
+        merged = bracket_merge(req.file_urls)
+        merged = apply_autohdr_finish(merged)
+
+        pil = Image.fromarray(cv2.cvtColor(merged, cv2.COLOR_BGR2RGB))
+        del merged; gc.collect()
+        buf = io.BytesIO()
+        pil.save(buf, format="JPEG", quality=94, optimize=True)
+        del pil; gc.collect()
+        buf.seek(0)
+        jpg_b64 = base64.b64encode(buf.read()).decode("utf-8")
+        del buf
+
+        return {"success": True, "bracket_name": req.bracket_name,
+                "width": OUTPUT_WIDTH, "height": OUTPUT_HEIGHT, "jpeg_base64": jpg_b64}
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"ERROR in /merge: {tb}")
+        raise HTTPException(500, detail=f"{str(e)}\n\nTraceback:\n{tb}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
