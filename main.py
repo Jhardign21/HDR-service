@@ -624,85 +624,27 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
 def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Light finish pass — lets the Enfuse merge show through with minimal
-    manipulation. Easy to tune after reviewing results.
-
-    Steps:
-      1. CLAHE on L-channel (gentle contrast)
-      2. Ceiling white-balance (de-yellow bright flat surfaces)
-      3. Light L-channel sharpen (edge pop, no grain)
-      4. Bilateral denoise (clean up)
+    Minimal finish pass — lets the Enfuse merge show through naturally.
+    Only gentle contrast + light sharpen + denoise. No color manipulation.
     """
-    img = img_bgr.astype(np.float32) / 255.0
+    img_u8 = img_bgr
 
-    # ── 0. Window protect mask (don't lift blown windows) ────────────────────
-    lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    win_mask = np.clip((lum_raw - 0.72) / (1.0 - 0.72 + 1e-6), 0, 1) ** 1.2
-    win_mask = cv2.GaussianBlur(win_mask.astype(np.float32), (0, 0), 12, 12)
-    win_mask = np.clip(win_mask, 0, 1)
-    win3 = win_mask[:, :, np.newaxis]
-    int3 = 1.0 - win3
-
-    # ── 1. Gamma lift — brighten interior, protect windows ───────────────────
-    gamma = 0.55
-    lifted = np.clip(np.power(np.clip(img, 0, 1), gamma), 0, 1)
-    img = lifted * int3 + img * win3
-    img = np.clip(img, 0, 1)
-
-    # ── 2. Shadow fill — open up dark corners ────────────────────────────────
-    lum = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask = np.clip(1.0 - lum / 0.35, 0, 1) ** 1.5
-    fill_mask = fill_mask * int3[:, :, 0]
-    fill3 = fill_mask[:, :, np.newaxis]
-    img = img + fill3 * 0.25 * (1.0 - img)
-    img = np.clip(img, 0, 1)
-
-    # ── 3. CLAHE on L-channel (contrast recovery after gamma lift) ───────────
-    img_u8 = (img * 255).astype(np.uint8)
+    # ── 1. Gentle CLAHE on L-channel (subtle contrast) ────────────────────────
     lab = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     l = clahe.apply(l)
     img_u8 = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
-    img = img_u8.astype(np.float32) / 255.0
 
-    # ── 4. White balance — neutralize brown/yellow cast on walls & ceiling ────
-    img_u8 = (img * 255).astype(np.uint8)
-    img_u8 = intelligent_white_balance(img_u8)
-    img_u8 = neutralize_yellow_cast(img_u8)
-    img = img_u8.astype(np.float32) / 255.0
-
-    # ── 4b. Window highlight rolloff + color recovery ────────────────────────
-    # Pull down blown window zones and boost saturation to recover exterior color
-    lum_w = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    blown = np.clip((lum_w - 0.72) / (1.0 - 0.72 + 1e-6), 0, 1) ** 1.3
-    blown = cv2.GaussianBlur(blown.astype(np.float32), (0, 0), 8, 8)
-    blown3 = blown[:, :, np.newaxis]
-    # Pull blown highlights down toward 0.82 — recovers detail
-    img = img * (1.0 - blown3 * 0.50) + (img * (0.82 / (lum_w[:, :, np.newaxis] + 1e-6))) * (blown3 * 0.50)
-    img = np.clip(img, 0, 1)
-    # Boost saturation in window zones to recover exterior greenery color
-    img_u8_sat = (img * 255).astype(np.uint8)
-    hsv_sat = cv2.cvtColor(img_u8_sat, cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat_boost = 65.0 * win_mask  # only in window zones
-    hsv_sat[:, :, 1] = np.clip(hsv_sat[:, :, 1] + sat_boost, 0, 255)
-    img = cv2.cvtColor(hsv_sat.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
-
-    # ── 4c. Shadow anchoring — deepen fireplace & darkest shadows for depth ──
-    img_u8_shadow = (img * 255).astype(np.uint8)
-    img_u8_shadow = anchor_ambient_shadows(img_u8_shadow)
-    img = img_u8_shadow.astype(np.float32) / 255.0
-
-    # ── 5. Light L-channel sharpen (edge pop) ─────────────────────────────────
-    img_u8 = (img * 255).astype(np.uint8)
+    # ── 2. Light L-channel sharpen (edge pop) ─────────────────────────────────
     lab_sharp = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
     l_s, a_s, b_s = cv2.split(lab_sharp)
     laplacian = cv2.Laplacian(l_s, cv2.CV_64F, ksize=3)
     laplacian = np.clip(np.absolute(laplacian), 0, 255).astype(np.uint8)
-    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.12, 0)
+    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.10, 0)
     img_u8 = cv2.cvtColor(cv2.merge((l_s, a_s, b_s)), cv2.COLOR_LAB2BGR)
 
-    # ── 6. Bilateral denoise (clean up, keep hard edges) ──────────────────────
+    # ── 3. Bilateral denoise (clean up, keep hard edges) ──────────────────────
     result_bgr = cv2.bilateralFilter(img_u8, d=5, sigmaColor=45, sigmaSpace=45)
 
     mean_final = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY).mean()
