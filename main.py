@@ -457,7 +457,7 @@ def anchor_ambient_shadows(img: np.ndarray) -> np.ndarray:
     _, shadow_mask = cv2.threshold(l, 45, 255, cv2.THRESH_BINARY_INV)
     shadow_blur = cv2.GaussianBlur(shadow_mask, (15, 15), 0)
     l_f = l.astype(np.float32)
-    factor = 1.0 - (shadow_blur.astype(np.float32) / 255.0) * 0.12
+    factor = 1.0 - (shadow_blur.astype(np.float32) / 255.0) * 0.20
     l_anchored = np.clip(l_f * factor, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge((l_anchored, a, b)), cv2.COLOR_LAB2BGR)
 
@@ -521,7 +521,6 @@ def enfuse_merge(images: List[np.ndarray], output_width: int, output_height: int
             "--contrast-weight=0.0",
             "--exposure-optimum=0.5",
             "--exposure-width=0.2",
-            "--hard-mask",
             "--no-ciecam",
             "--output=" + out_path,
         ] + in_paths
@@ -552,30 +551,18 @@ def enfuse_merge(images: List[np.ndarray], output_width: int, output_height: int
 
 def bracket_merge(file_urls: List[str]) -> np.ndarray:
     """
-    Professional HDR merge — flambient/Autoenhance-inspired:
+    Simple Enfuse-based HDR merge.
 
-    Phase 1 — RAW frames (pre-normalisation):
-      a. Download & decode
-      b. Resize
-      c. Build HYBRID window mask (LSD geometric + photometric brightness)
-         from the RAW dark frame — BEFORE any normalisation
-      d. Select best window-detail frame (by edge score inside window zone)
+    Lets Enfuse handle the exposure fusion directly on the decoded RAW frames.
+    Enfuse uses the real exposure differences between frames to decide which
+    frame to weight where — so we do NOT pre-normalise exposures (that would
+    destroy the very information Enfuse relies on).
 
-    Phase 2 — Exposure-normalised frames (for interior):
-      e. Normalise bright frames to target mean ~115 (open interior)
-      f. Normalise dark frame to a LOWER target ~75 (preserve window detail)
-      g. AlignMTB
-      h. Mertens fusion of normalised frames (ambient interior base)
-
-    Phase 3 — Composite:
-      i. Start from Mertens base (good interior exposure)
-      j. Blend brightest normalised frame into remaining dark interior zones
-      k. Composite window zones from best raw window frame (real exterior detail)
-      l. Feathered blend using the pre-normalisation hybrid window mask
+    Falls back to OpenCV Mertens only if the Enfuse binary is unavailable.
     """
     tmp_paths = []
     try:
-        # ── Phase 1a-b: Download, decode, resize ─────────────────────────────
+        # ── Download & decode ─────────────────────────────────────────────────
         print(f"Downloading {len(file_urls)} frames...")
         for url in file_urls:
             ext = url.split("?")[0].rsplit(".", 1)[-1]
@@ -586,156 +573,36 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
         for p in tmp_paths:
             img = load_image_bgr(p)
             img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_AREA)
-            # Perspective correction on each frame before any merging
-            img = correct_vertical_perspective(img)
             raw_images.append(img)
         print(f"Loaded {len(raw_images)} frames at {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}")
-
-        # Sort raw frames dark→bright by mean luminance
-        means_raw = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in raw_images]
-        order_raw = list(np.argsort(means_raw))
-        raw_images = [raw_images[i] for i in order_raw]
-        means_raw  = [means_raw[i]  for i in order_raw]
-        print(f"Raw frame means dark→bright: {[round(m, 1) for m in means_raw]}")
 
         single_shot = len(raw_images) == 1
         if single_shot:
             raw_images = synthesize_brackets(raw_images[0])
-            means_raw  = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in raw_images]
 
-        raw_dark_frame   = raw_images[0]
-        raw_bright_frame = raw_images[-1]
-
-        # ── Phase 1c: Build HYBRID window mask from RAW dark frame ────────────
-        # CRITICAL: must be done before normalisation — after normalisation the
-        # exposure differential is destroyed and window detection fails.
-        # LSD geometric layer catches windows that aren't fully blown out
-        # (overcast days, curtained windows, windows at angle) where the
-        # pure brightness threshold misses them.
-        print("Building hybrid connected-components + photometric window mask...")
-        win_mask  = build_window_mask_from_raw(raw_dark_frame, raw_bright_frame, sigma=18.0)
-        win_mask3 = win_mask[:, :, np.newaxis]
-        interior3 = 1.0 - win_mask3
-
-        # ── Phase 1d: Select best window-detail frame ─────────────────────────
-        # For window pull we ALWAYS want the darkest raw frame — it has the most
-        # exterior detail. Edge-score selection can pick a mid/bright frame when
-        # window mullions are sharp there, which is the wrong source for exterior.
-        print("Using darkest raw frame as window source (best exterior detail)...")
-        best_window_frame = raw_images[0]  # darkest = most exterior detail
-        print(f"  Dark frame mean: {means_raw[0]:.1f}")
-
-        # ── Phase 2: Denoise raw frames ───────────────────────────────────────
-        # Bilateral filter: smooths flat walls, preserves window frame/mullion edges
-        print("Denoising (bilateral - light pass to preserve texture)...")
+        # ── Light denoise (preserves edges, cleans RAW noise) ─────────────────
+        print("Denoising (bilateral)...")
         raw_images = [cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
                       for img in raw_images]
-        best_window_frame = cv2.bilateralFilter(best_window_frame, d=5,
-                            sigmaColor=45, sigmaSpace=45)
         gc.collect()
 
-        # ── Phase 2e-f: Exposure normalisation ────────────────────────────────
-        print("Normalising exposures...")
-        norm_images = []
-        for i, img in enumerate(raw_images):
-            if i == 0:      # darkest: lower target preserves window contrast
-                target = 75.0
-            elif i == len(raw_images) - 1:  # brightest: open the interior
-                target = 120.0
-            else:           # mid frames
-                target = 105.0
-            norm_images.append(normalise_to_target(img, target))
+        # ── Enfuse — let it do the exposure fusion ────────────────────────────
+        merged = enfuse_merge(raw_images, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
-        norm_bright_frame = norm_images[-1]
-        norm_means = [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() for img in norm_images]
-        print(f"Normalised means: {[round(m, 1) for m in norm_means]}")
-        gc.collect()
-
-        # ── Phase 2g: AlignMTB ─────────────────────────────────────────────────
-        if len(norm_images) > 1:
-            print("Aligning...")
-            align = cv2.createAlignMTB(max_bits=6, exclude_range=4, cut=True)
-            align.process(norm_images, norm_images)
-            gc.collect()
-
-        # ── Phase 2h: Mertens fusion (interior ambient base) ──────────────────
-        if not single_shot and len(norm_images) > 1:
-            norm_images = deghost(norm_images, ref_idx=len(norm_images) // 2)
-            gc.collect()
-
-        # ── Phase 2h: Fusion — Enfuse first (industry standard), Mertens fallback ─
-        mertens_base = None
-        if not single_shot and len(norm_images) > 1:
-            mertens_base = enfuse_merge(norm_images, OUTPUT_WIDTH, OUTPUT_HEIGHT)
-        if mertens_base is None:
-            print("Mertens fusion (interior base)...")
+        if merged is None:
+            # Fallback: Mertens (only if Enfuse binary missing/failed)
+            print("Mertens fallback fusion...")
             fused = cv2.createMergeMertens(
                 contrast_weight=1.5,
                 saturation_weight=1.2,
-                exposure_weight=0.0,   # 0.0 = no milky gray midtone pull from Mertens
-            ).process(norm_images)
-            mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
+                exposure_weight=0.0,
+            ).process(raw_images)
+            merged = np.clip(fused * 255, 0, 255).astype(np.uint8)
             del fused; gc.collect()
-        else:
-            gc.collect()
 
-        # Post-fusion: strong CLAHE + LAB b-channel ceiling fix
-        print("Applying CLAHE + ceiling color fix to Mertens base...")
-        lab = cv2.cvtColor(mertens_base, cv2.COLOR_BGR2LAB)
-        l, a, b_ch = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        # Force bright zones (ceiling/walls L>195) toward neutral on b-channel
-        _, bright_spots = cv2.threshold(l, 195, 255, cv2.THRESH_BINARY)
-        b_ch = np.where(bright_spots == 255,
-                        cv2.addWeighted(b_ch, 0.65, np.full_like(b_ch, 128), 0.35, 0),
-                        b_ch)
-        mertens_base = cv2.cvtColor(cv2.merge((l, a, b_ch)), cv2.COLOR_LAB2BGR)
-
-        # ── Phase 3i-j: Start from Mertens, boost dark interior zones ─────────
-        print("Interior composite...")
-        mertens_f = mertens_base.astype(np.float32) / 255.0
-        bright_f  = norm_bright_frame.astype(np.float32) / 255.0
-        lum_m     = 0.299 * mertens_f[:, :, 2] + 0.587 * mertens_f[:, :, 1] + 0.114 * mertens_f[:, :, 0]
-
-        dark_interior_mask = np.clip(1.0 - lum_m / 0.45, 0, 1) ** 1.5
-        dark_interior_mask = dark_interior_mask * interior3[:, :, 0]
-        dark_interior_mask = cv2.GaussianBlur(dark_interior_mask.astype(np.float32), (0, 0), 10, 10)
-        dark_interior_mask = np.clip(dark_interior_mask, 0, 0.70)[:, :, np.newaxis]
-
-        interior_f = mertens_f + dark_interior_mask * (bright_f - mertens_f)
-        interior_f = np.clip(interior_f, 0, 1)
-
-        # ── Phase 3k: Window pull — differential mask drives compositing ─────
-        print("Window composite (delta mask)...")
-        win_frame_normed = normalise_to_target(best_window_frame, target_mean=80.0)
-        win_frame_f      = win_frame_normed.astype(np.float32) / 255.0
-
-        # Use the pre-computed delta mask (exposure differential) as primary driver.
-        # win_mask3 was built from the same delta approach — use it directly.
-        # Add a small blown-pixel safety net for any zones the delta missed.
-        lum_interior = (0.299 * interior_f[:, :, 2] +
-                        0.587 * interior_f[:, :, 1] +
-                        0.114 * interior_f[:, :, 0])
-        blown_safety = np.clip((lum_interior - 0.90) / 0.10, 0, 1)  # only truly blown (>0.90)
-        blown_safety = cv2.GaussianBlur(blown_safety.astype(np.float32), (21, 21), 0)
-
-        # Primary: delta mask. Secondary: tiny safety net. No wall-glare bleed.
-        combined_mask = np.clip(win_mask3 + blown_safety[:, :, np.newaxis] * 0.3, 0, 1)
-
-        # Blend: blown/window zones → exterior dark frame; room → interior
-        composited_f = interior_f * (1.0 - combined_mask) + win_frame_f * combined_mask
-        composited_f = np.clip(composited_f, 0, 1)
-
-        print(f"  Window pull: {combined_mask.mean()*100:.1f}% of image replaced")
-
-        composited = np.clip(composited_f * 255, 0, 255).astype(np.uint8)
-        del mertens_f, bright_f, win_frame_f, composited_f, win_mask3, mertens_base
-        gc.collect()
-
-        mean_out = cv2.cvtColor(composited, cv2.COLOR_BGR2GRAY).mean()
+        mean_out = cv2.cvtColor(merged, cv2.COLOR_BGR2GRAY).mean()
         print(f"Merge complete. Output mean brightness: {mean_out:.1f}/255")
-        return composited
+        return merged
 
     finally:
         for p in tmp_paths:
@@ -749,140 +616,37 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
 
 def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Finish pass — tuned to match target: bright neutral beige tones, strong
-    shadow fill on dark sides, controlled window highlights, no yellow-green cast.
-
-    Parameters calibrated by AI diff analysis against target reference:
-      gamma=0.42, highlight_start=0.72, fill_cutoff=0.38, fill_strength=0.32
-      r_mult=1.04, g_mult=1.01, b_mult=0.93, vibrance=18, sharpen=0.55/1.2r
+    Light finish pass — lets the Enfuse merge show through with minimal
+    manipulation. Easy to tune after reviewing results.
 
     Steps:
-      1. Gamma lift (aggressive — interior was too dark overall)
-      2. Highlight rolloff (starts at 0.72 — earlier than before to control windows)
-      3. Large-radius USM on L-channel: 3D depth pop, no grain
-      4. Wall/ceiling zone: desaturate + cast removal (removes yellow-green cast)
-      5. Shadow fill — stronger cutoff (0.38) and fill (0.32) for dark corners
-      6. Colour grade: R+4%, G+1%, B-7% — eliminates yellow-green cast globally
-      7. Vibrance (18 units)
-      8. Sharpening (0.55 amount, 1.2px radius)
+      1. CLAHE on L-channel (gentle contrast)
+      2. Ceiling white-balance (de-yellow bright flat surfaces)
+      3. Light L-channel sharpen (edge pop, no grain)
+      4. Bilateral denoise (clean up)
     """
-    img = img_bgr.astype(np.float32) / 255.0
+    img = img_bgr
 
-    # ── Window protect mask ───────────────────────────────────────────────────
-    lum_raw = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    b_chan, g_chan, r_chan = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-    # Lower threshold to 0.58 — protect windows more aggressively from gamma lift
-    lum_win  = np.clip((lum_raw - 0.58) / (1.0 - 0.58 + 1e-6), 0, 1) ** 1.2
-    blue_dom = np.clip((b_chan - np.maximum(r_chan, g_chan) + 0.05) / 0.12, 0, 1)
-    blue_dom = blue_dom * (lum_raw > 0.45).astype(np.float32)
-    win_raw      = np.clip(lum_win * 0.8 + blue_dom * 0.2, 0, 1)
-    win_protect  = cv2.GaussianBlur(win_raw.astype(np.float32), (0, 0), 12, 12)
-    win_protect  = np.clip(win_protect, 0, 1)
-    win_protect3 = win_protect[:, :, np.newaxis]
-    interior3    = 1.0 - win_protect3
+    # ── 1. CLAHE on L-channel (gentle contrast) ──────────────────────────────
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    img = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-    # ── 1. Gamma lift — aggressive to match bright target ────────────────────
-    # gamma=0.38 → stronger lift to match well-exposed target brightness
-    gamma = 0.38
-    img_interior = np.clip(np.power(np.clip(img, 0, 1), gamma), 0, 1)
-    img = img_interior * interior3 + img * win_protect3
-    img = np.clip(img, 0, 1)
+    # ── 2. Ceiling white-balance (de-yellow bright flat surfaces) ────────────
+    img = intelligent_white_balance(img)
 
-    # ── 2. Highlight rolloff (interior only, protect windows) ────────────────
-    # Rolls off highlights starting at 0.72 to cap bright walls at 0.88
-    # This prevents the white ceiling/walls from blowing while interior is bright
-    highlight_start  = 0.72
-    highlight_cap    = 0.96
-    highlight_str    = 0.65
-    lum_h = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    hl_mask = np.clip((lum_h - highlight_start) / (1.0 - highlight_start + 1e-6), 0, 1) ** 1.5
-    hl_mask = hl_mask * interior3[:, :, 0]
-    hl_mask3 = hl_mask[:, :, np.newaxis]
-    # Blend toward highlight_cap in blown zones
-    target_hl = img * (highlight_cap / (lum_h[:, :, np.newaxis] + 1e-6))
-    target_hl = np.clip(target_hl, 0, 1)
-    img = img * (1.0 - hl_mask3 * highlight_str) + target_hl * (hl_mask3 * highlight_str)
-    img = np.clip(img, 0, 1)
-
-    # ── 3. Large-radius USM on L-channel ─────────────────────────────────────
-    img_u8 = (img * 255).astype(np.uint8)
-    img_u8 = local_contrast_enhance(img_u8, radius=45.0, amount=0.20)
-    img    = img_u8.astype(np.float32) / 255.0
-
-    # ── 4. Wall/ceiling zone — desaturate + cast removal ─────────────────────
-    lum2 = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    wall_mask = np.clip((lum2 - 0.30) / (0.95 - 0.30), 0, 1)
-    wall_mask = wall_mask * (1.0 - win_protect)
-    wall_mask = cv2.GaussianBlur(wall_mask.astype(np.float32), (0, 0), 8, 8)
-    wall_mask = np.clip(wall_mask, 0, 1)
-    wall_mask3 = wall_mask[:, :, np.newaxis]
-
-    # Stronger desaturation on walls to remove yellow-green cast
-    img_u8_tmp = (img * 255).astype(np.uint8)
-    hsv_tmp = cv2.cvtColor(img_u8_tmp, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv_tmp[:, :, 1] = hsv_tmp[:, :, 1] * (1.0 - wall_mask * 0.55)  # was 0.45
-    img = cv2.cvtColor(np.clip(hsv_tmp, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
-
-    # Subtle b-channel pull only — removes yellow-green without touching warm beige tone
-    wall_sum = wall_mask.sum() + 1e-6
-    mean_b   = (img[:, :, 0] * wall_mask).sum() / wall_sum
-    mean_g   = (img[:, :, 1] * wall_mask).sum() / wall_sum
-    # Only correct if blue is significantly lower than green (yellow-green cast present)
-    if mean_g > mean_b * 1.08:
-        cor_b = np.clip(mean_g / (mean_b + 1e-6), 1.0, 1.06)
-        img[:, :, 0] = np.clip(img[:, :, 0] * (1.0 + (cor_b - 1.0) * wall_mask * 0.30), 0, 1)
-
-    # Brightness push on walls
-    img = img + wall_mask3 * 0.08 * (1.0 - img)
-    img = np.clip(img, 0, 1)
-
-    # ── 5. Shadow fill — lift dark corners aggressively ──────────────────────
-    lum3       = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    fill_mask  = np.clip(1.0 - lum3 / 0.45, 0, 1) ** 1.3   # wider cutoff, softer curve
-    fill_mask3 = fill_mask[:, :, np.newaxis]
-    img = img + fill_mask3 * 0.40 * (1.0 - img) * interior3  # stronger fill
-    img = np.clip(img, 0, 1)
-
-    # ── 5b. Smart ceiling white-balancer (de-yellowing) ─────────────────────
-    # Replaces the manual desat+brighten with a proper LAB b-channel pull
-    img_u8_wb = (img * 255).astype(np.uint8)
-    img_u8_wb = intelligent_white_balance(img_u8_wb)
-    img = img_u8_wb.astype(np.float32) / 255.0
-
-    # ── 6. Colour grade — R+5%, G+1%, B-7% warm beige tone ───────────────────
-    img[:, :, 2] = np.clip(img[:, :, 2] * 1.05, 0, 1)  # R up — warm
-    img[:, :, 1] = np.clip(img[:, :, 1] * 1.01, 0, 1)  # G neutral
-    img[:, :, 0] = np.clip(img[:, :, 0] * 0.93, 0, 1)  # B down — remove cool cast
-
-    # ── 7. Vibrance (18 units — moderate, interior surfaces only) ─────────────
-    img_u8 = (img * 255).astype(np.uint8)
-    hsv    = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat_n  = hsv[:, :, 1] / 255.0
-    vib_zone  = np.clip(1.0 - wall_mask, 0, 1)
-    vib_boost = 18.0 * (1.0 - sat_n) ** 1.5 * vib_zone  # was 12
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] + vib_boost, 0, 255)
-    img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
-
-    # ── 7b. Ambient shadow anchoring — deepens blacks before sharpening ──────
-    img_u8_shadow = (img * 255).astype(np.uint8)
-    img_u8_shadow = anchor_ambient_shadows(img_u8_shadow)
-    img = img_u8_shadow.astype(np.float32) / 255.0
-
-    # ── 8. Sharpening: Laplacian edge pop + unsharp micro-contrast pass ──────
-    img_u8 = (img * 255).astype(np.uint8)
-    # Laplacian high-pass on L channel — pops architectural lines without grain
-    lab_sharp = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
+    # ── 3. Light L-channel sharpen (edge pop, no grain) ──────────────────────
+    lab_sharp = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_s, a_s, b_s = cv2.split(lab_sharp)
     laplacian = cv2.Laplacian(l_s, cv2.CV_64F, ksize=3)
     laplacian = np.clip(np.absolute(laplacian), 0, 255).astype(np.uint8)
-    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.30, 0)
-    img_u8 = cv2.cvtColor(cv2.merge((l_s, a_s, b_s)), cv2.COLOR_LAB2BGR)
-    # Final micro-contrast unsharp mask (removes residual haze)
-    kernel_sharpen = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]], dtype=np.float32)
-    sharpened = cv2.filter2D(img_u8, -1, kernel_sharpen)
-    img_u8 = cv2.addWeighted(img_u8, 0.88, sharpened, 0.12, 0)
-    # Light bilateral AFTER all color work — smooths noise, keeps hard edges
-    result_bgr = cv2.bilateralFilter(img_u8, d=5, sigmaColor=35, sigmaSpace=35)
+    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.10, 0)
+    img = cv2.cvtColor(cv2.merge((l_s, a_s, b_s)), cv2.COLOR_LAB2BGR)
+
+    # ── 4. Bilateral denoise (clean up, keep hard edges) ─────────────────────
+    result_bgr = cv2.bilateralFilter(img, d=5, sigmaColor=40, sigmaSpace=40)
 
     mean_final = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY).mean()
     print(f"Finish applied. Final mean: {mean_final:.1f}/255")
