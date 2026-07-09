@@ -12,6 +12,8 @@ import io
 import base64
 import gc
 import traceback
+import subprocess
+import shutil
 
 app = FastAPI(title="HDR Merge Service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -486,6 +488,65 @@ def local_contrast_enhance(img_bgr: np.ndarray, radius: float = 45.0, amount: fl
 
 
 # ---------------------------------------------------------------------------
+# Enfuse-based exposure fusion (industry-standard, cleaner than Mertens)
+# ---------------------------------------------------------------------------
+
+def enfuse_available() -> bool:
+    return shutil.which("enfuse") is not None
+
+
+def enfuse_merge(images: List[np.ndarray], output_width: int, output_height: int) -> Optional[np.ndarray]:
+    """
+    Runs Enfuse on the given BGR uint8 frames and returns the fused result.
+    Returns None if enfuse is unavailable or fails (caller falls back to Mertens).
+    """
+    if not enfuse_available():
+        print("  Enfuse binary not found — falling back to Mertens")
+        return None
+
+    tmp_dir = tempfile.mkdtemp(prefix="enfuse_", dir="/tmp")
+    in_paths = []
+    out_path = os.path.join(tmp_dir, "fused.tif")
+    try:
+        for i, img in enumerate(images):
+            p = os.path.join(tmp_dir, f"frame_{i:02d}.tif")
+            cv2.imwrite(p, img)
+            in_paths.append(p)
+
+        cmd = [
+            "enfuse",
+            "--depth=8",
+            "--exposure-weight=1.0",
+            "--saturation-weight=0.2",
+            "--contrast-weight=0.0",
+            "--exposure-optimum=0.5",
+            "--exposure-width=0.2",
+            "--hard-mask",
+            "--no-ciecam",
+            "--output=" + out_path,
+        ] + in_paths
+
+        print(f"  Running enfuse on {len(in_paths)} frames...")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            print(f"  Enfuse failed (rc={proc.returncode}): {proc.stderr[:500]}")
+            return None
+
+        result = cv2.imread(out_path, cv2.IMREAD_COLOR)
+        if result is None:
+            print("  Enfuse output unreadable")
+            return None
+        result = cv2.resize(result, (output_width, output_height), interpolation=cv2.INTER_AREA)
+        print(f"  Enfuse OK. Output mean: {cv2.cvtColor(result, cv2.COLOR_BGR2GRAY).mean():.1f}")
+        return result
+    except Exception as e:
+        print(f"  Enfuse error: {e}")
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # CORE MERGE PIPELINE
 # ---------------------------------------------------------------------------
 
@@ -602,14 +663,21 @@ def bracket_merge(file_urls: List[str]) -> np.ndarray:
             norm_images = deghost(norm_images, ref_idx=len(norm_images) // 2)
             gc.collect()
 
-        print("Mertens fusion (interior base)...")
-        fused = cv2.createMergeMertens(
-            contrast_weight=1.5,
-            saturation_weight=1.2,
-            exposure_weight=0.0,   # 0.0 = no milky gray midtone pull from Mertens
-        ).process(norm_images)
-        mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
-        del fused; gc.collect()
+        # ── Phase 2h: Fusion — Enfuse first (industry standard), Mertens fallback ─
+        mertens_base = None
+        if not single_shot and len(norm_images) > 1:
+            mertens_base = enfuse_merge(norm_images, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+        if mertens_base is None:
+            print("Mertens fusion (interior base)...")
+            fused = cv2.createMergeMertens(
+                contrast_weight=1.5,
+                saturation_weight=1.2,
+                exposure_weight=0.0,   # 0.0 = no milky gray midtone pull from Mertens
+            ).process(norm_images)
+            mertens_base = np.clip(fused * 255, 0, 255).astype(np.uint8)
+            del fused; gc.collect()
+        else:
+            gc.collect()
 
         # Post-fusion: strong CLAHE + LAB b-channel ceiling fix
         print("Applying CLAHE + ceiling color fix to Mertens base...")
