@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libgl1 \
     gcc \
+    enblend \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
