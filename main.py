@@ -454,10 +454,10 @@ def anchor_ambient_shadows(img: np.ndarray) -> np.ndarray:
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    _, shadow_mask = cv2.threshold(l, 45, 255, cv2.THRESH_BINARY_INV)
+    _, shadow_mask = cv2.threshold(l, 65, 255, cv2.THRESH_BINARY_INV)
     shadow_blur = cv2.GaussianBlur(shadow_mask, (15, 15), 0)
     l_f = l.astype(np.float32)
-    factor = 1.0 - (shadow_blur.astype(np.float32) / 255.0) * 0.20
+    factor = 1.0 - (shadow_blur.astype(np.float32) / 255.0) * 0.35
     l_anchored = np.clip(l_f * factor, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge((l_anchored, a, b)), cv2.COLOR_LAB2BGR)
 
@@ -470,17 +470,21 @@ def intelligent_white_balance(img: np.ndarray) -> np.ndarray:
     """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    _, ceiling_zone = cv2.threshold(l, 160, 255, cv2.THRESH_BINARY)
+    _, ceiling_zone = cv2.threshold(l, 140, 255, cv2.THRESH_BINARY)
     ceiling_blur = cv2.GaussianBlur(ceiling_zone, (21, 21), 0)
     mask_w = ceiling_blur.astype(np.float32) / 255.0
     a_f = a.astype(np.float32)
     b_f = b.astype(np.float32)
-    pull = 0.70
+    l_f = l.astype(np.float32)
+    pull = 0.85
     a_corrected = (a_f * (1.0 - mask_w * pull)) + (128.0 * (mask_w * pull))
     b_corrected = (b_f * (1.0 - mask_w * pull)) + (128.0 * (mask_w * pull))
+    # Also lift L in ceiling zones to make them truly bright white
+    l_corrected = l_f + mask_w * (240.0 - l_f) * 0.35
     a_corrected = np.clip(a_corrected, 0, 255).astype(np.uint8)
     b_corrected = np.clip(b_corrected, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(cv2.merge((l, a_corrected, b_corrected)), cv2.COLOR_LAB2BGR)
+    l_corrected = np.clip(l_corrected, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge((l_corrected, a_corrected, b_corrected)), cv2.COLOR_LAB2BGR)
 
 
 def local_contrast_enhance(img_bgr: np.ndarray, radius: float = 45.0, amount: float = 0.20) -> np.ndarray:
@@ -671,16 +675,16 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     # ── 4b. Window highlight rolloff + color recovery ────────────────────────
     # Pull down blown window zones and boost saturation to recover exterior color
     lum_w = 0.299 * img[:, :, 2] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 0]
-    blown = np.clip((lum_w - 0.80) / (1.0 - 0.80 + 1e-6), 0, 1) ** 1.5
+    blown = np.clip((lum_w - 0.72) / (1.0 - 0.72 + 1e-6), 0, 1) ** 1.3
     blown = cv2.GaussianBlur(blown.astype(np.float32), (0, 0), 8, 8)
     blown3 = blown[:, :, np.newaxis]
-    # Pull blown highlights down toward 0.88 — recovers detail
-    img = img * (1.0 - blown3 * 0.35) + (img * (0.88 / (lum_w[:, :, np.newaxis] + 1e-6))) * (blown3 * 0.35)
+    # Pull blown highlights down toward 0.82 — recovers detail
+    img = img * (1.0 - blown3 * 0.50) + (img * (0.82 / (lum_w[:, :, np.newaxis] + 1e-6))) * (blown3 * 0.50)
     img = np.clip(img, 0, 1)
     # Boost saturation in window zones to recover exterior greenery color
     img_u8_sat = (img * 255).astype(np.uint8)
     hsv_sat = cv2.cvtColor(img_u8_sat, cv2.COLOR_BGR2HSV).astype(np.float32)
-    sat_boost = 35.0 * win_mask  # only in window zones
+    sat_boost = 65.0 * win_mask  # only in window zones
     hsv_sat[:, :, 1] = np.clip(hsv_sat[:, :, 1] + sat_boost, 0, 255)
     img = cv2.cvtColor(hsv_sat.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
 
