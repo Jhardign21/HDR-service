@@ -768,106 +768,18 @@ def smart_resize(img: np.ndarray, max_dim: int = 3000) -> np.ndarray:
 # Lightroom-style adjustment primitives (masked, feathered, float32)
 # ---------------------------------------------------------------------------
 
-def lr_exposure(img_bgr: np.ndarray, gamma: float = 0.55) -> np.ndarray:
-    """
-    Major exposure lift — gamma < 1 brightens midtones aggressively.
-    0.55 ≈ +1.5 stops. The high-key real estate look starts here.
-    """
-    f = img_bgr.astype(np.float32) / 255.0
-    return np.clip(np.power(f, gamma) * 255.0, 0, 255).astype(np.uint8)
-
-
-def lr_highlights(img_bgr: np.ndarray, threshold: float = 215.0,
-                  pull: float = 45.0) -> np.ndarray:
-    """
-    Lower highlights — recover blown window detail WITHOUT darkening the
-    whole image. Only affects bright zones (L > threshold), heavily feathered
-    (Gaussian sigma=20) so transitions are smooth. This is the 'Highlights'
-    slider in Lightroom, automatically masked to bright/window zones.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l = lab[:, :, 0]
-    mask = np.clip((l - threshold) / (255 - threshold + 1e-6), 0, 1) ** 1.5
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=20, sigmaY=20)
-    lab[:, :, 0] = np.clip(l - mask * pull, 0, 255)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def lr_shadows(img_bgr: np.ndarray, threshold: float = 80.0,
-               lift: float = 55.0) -> np.ndarray:
-    """
-    Lift shadows — brighten dark zones (L < threshold) for the airy, high-key
-    look. Only affects shadows, heavily feathered. Windows and ceilings stay
-    untouched. This is the 'Shadows' slider in Lightroom.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l = lab[:, :, 0]
-    mask = np.clip((threshold - l) / threshold, 0, 1) ** 1.2
-    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=20, sigmaY=20)
-    lab[:, :, 0] = np.clip(l + mask * lift, 0, 255)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def lr_whites_blacks(img_bgr: np.ndarray, white_push: float = 12.0,
-                     black_lift: float = 15.0) -> np.ndarray:
-    """
-    Tweak whites and blacks — push the brightest values brighter (clean white
-    ceilings) and lift the darkest values (no crushed blacks). This is the
-    'Whites' and 'Blacks' slider pair in Lightroom.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l = lab[:, :, 0]
-    white_mask = np.clip((l - 200) / 55, 0, 1)
-    black_mask = np.clip((40 - l) / 40, 0, 1)
-    lab[:, :, 0] = np.clip(l + white_mask * white_push + black_mask * black_lift, 0, 255)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def lr_white_balance(img_bgr: np.ndarray) -> np.ndarray:
-    """
-    Zone-targeted white balance — neutralizes green/yellow cast in BRIGHT
-    zones (ceilings, walls near windows) where window light introduces a
-    green tint. Dark zones (plants, furniture) keep their natural color.
-    Pulls a-channel (green) and b-channel (yellow) toward 128 by 75% in
-    L>160 areas, heavily feathered for smooth transitions.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l = lab[:, :, 0]
-    bright_w = np.clip((l - 160.0) / 40.0, 0, 1)
-    bright_w = cv2.GaussianBlur(bright_w, (0, 0), sigmaX=15, sigmaY=15)
-    pull = 0.75
-    lab[:, :, 1] = lab[:, :, 1] * (1.0 - bright_w * pull) + 128.0 * (bright_w * pull)
-    lab[:, :, 2] = lab[:, :, 2] * (1.0 - bright_w * pull) + 128.0 * (bright_w * pull)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def lr_saturation(img_bgr: np.ndarray, factor: float = 1.15) -> np.ndarray:
-    """
-    Add a bit of saturation — boost a,b channels in LAB by a factor.
-    1.15 = +15% saturation. Brings floors, plants, furniture to life.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab[:, :, 1] = np.clip((lab[:, :, 1] - 128) * factor + 128, 0, 255)
-    lab[:, :, 2] = np.clip((lab[:, :, 2] - 128) * factor + 128, 0, 255)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
 def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
     """
-    Lightroom-style real estate enhancement for a single HDR photo.
-    Produces the bright, high-key, clean look of professional real estate editing:
-      1. Load at high resolution (cap 3000px — preserves HD quality)
-      2. Light denoise
-      3. Major exposure lift (high-key brightness)
-      4. Lower highlights (auto-masked to bright/window zones, feathered)
-      5. Lift shadows (auto-masked to dark zones, feathered)
-      6. Tweak whites & blacks (clean white ceilings, no crushed blacks)
-      7. Subtle white balance (neutral, slightly cool)
-      8. Add saturation (bring colors to life)
-      9. Sky replacement (optional, OFF by default)
-     10. Clean finish (clarity + sharpen + dither — no CLAHE banding)
-    All masking is photometric (brightness-based) with heavy Gaussian feathering
-    — no hard edges, no patchy artifacts, no AI model download needed.
+    Lightroom-style real estate enhancement — SINGLE float32 LAB pass.
+
+    All L-channel (exposure, highlights, shadows, whites/blacks, clarity) and
+    a/b-channel (white balance, saturation) adjustments happen in ONE LAB
+    round-trip to avoid 8-bit quantization banding on smooth ceilings/walls.
+    Previous pipeline had 6 separate LAB conversions — each one quantized the
+    ceiling gradient to 8-bit, creating visible horizontal banding lines.
+
+    Saturation is masked to EXCLUDE bright zones (ceilings) so the white balance
+    neutralization of green window-light spill isn't undone by re-amplification.
     """
     ext = file_url.split("?")[0].rsplit(".", 1)[-1]
     ext = f".{ext.lower()}" if ext else ".jpg"
@@ -881,28 +793,60 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
         # 1. Light denoise (preserve edges, don't soften)
         img = cv2.bilateralFilter(img, d=4, sigmaColor=30, sigmaSpace=30)
 
-        # 2. Major exposure lift — high-key real estate look
-        img = lr_exposure(img, gamma=0.48)
-        print(f"Exposure lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+        # 2. SINGLE float32 LAB pass — ALL tone & color adjustments here
+        #    One BGR→LAB conversion, one LAB→BGR conversion = no banding
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        l = lab[:, :, 0].copy()
+        a = lab[:, :, 1].copy()
+        b = lab[:, :, 2].copy()
 
-        # 3. Lower highlights — recover window detail (masked, feathered)
-        img = lr_highlights(img, threshold=215, pull=45)
-        print(f"Highlights lowered. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+        # 2a. Exposure lift (gamma on L — high-key brightness)
+        l = np.clip(np.power(l / 255.0, 0.48) * 255.0, 0, 255)
 
-        # 4. Lift shadows — bright, airy interior (masked, feathered)
-        img = lr_shadows(img, threshold=80, lift=65)
-        print(f"Shadows lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+        # 2b. Lower highlights (masked to bright zones, feathered)
+        hl_mask = np.clip((l - 215.0) / 40.0, 0, 1) ** 1.5
+        hl_mask = cv2.GaussianBlur(hl_mask, (0, 0), sigmaX=20, sigmaY=20)
+        l = np.clip(l - hl_mask * 45.0, 0, 255)
 
-        # 5. Tweak whites & blacks — clean whites, no crushed blacks
-        img = lr_whites_blacks(img, white_push=18, black_lift=15)
+        # 2c. Lift shadows (masked to dark zones, feathered)
+        sh_mask = np.clip((80.0 - l) / 80.0, 0, 1) ** 1.2
+        sh_mask = cv2.GaussianBlur(sh_mask, (0, 0), sigmaX=20, sigmaY=20)
+        l = np.clip(l + sh_mask * 65.0, 0, 255)
 
-        # 6. Zone-targeted white balance — kill green/yellow on ceilings, keep plants
-        img = lr_white_balance(img)
+        # 2d. Whites & blacks (clean white ceilings, no crushed blacks)
+        white_mask = np.clip((l - 200.0) / 55.0, 0, 1)
+        black_mask = np.clip((40.0 - l) / 40.0, 0, 1)
+        l = np.clip(l + white_mask * 18.0 + black_mask * 15.0, 0, 255)
 
-        # 7. Add saturation — vibrant plants and furniture
-        img = lr_saturation(img, factor=1.30)
+        # 2e. White balance — neutralize green/yellow in bright zones (ceilings)
+        #     85% pull toward neutral — kills window-light green spill on walls
+        bright_w = np.clip((l - 160.0) / 40.0, 0, 1)
+        bright_w = cv2.GaussianBlur(bright_w, (0, 0), sigmaX=15, sigmaY=15)
+        wb_pull = 0.85
+        a = a * (1.0 - bright_w * wb_pull) + 128.0 * (bright_w * wb_pull)
+        b = b * (1.0 - bright_w * wb_pull) + 128.0 * (bright_w * wb_pull)
 
-        # 8. Sky replacement (optional, off by default)
+        # 2f. Saturation — boost ONLY in mid/dark zones (plants, furniture)
+        #     Bright zones excluded so WB neutralization on ceilings holds
+        sat_mask = 1.0 - bright_w
+        sat_boost = 0.30
+        a = np.clip(a + (a - 128.0) * sat_boost * sat_mask, 0, 255)
+        b = np.clip(b + (b - 128.0) * sat_boost * sat_mask, 0, 255)
+
+        # 2g. Clarity — large-radius unsharp on L (midtone pop, no CLAHE)
+        l_norm = l / 255.0
+        l_blur = cv2.GaussianBlur(l_norm, (0, 0), sigmaX=25, sigmaY=25)
+        l_norm = np.clip(l_norm + 0.25 * (l_norm - l_blur), 0, 1)
+        l = l_norm * 255.0
+
+        # Convert back to BGR — single quantization, no banding
+        lab[:, :, 0] = l
+        lab[:, :, 1] = a
+        lab[:, :, 2] = b
+        img = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+        print(f"LAB pass done. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+
+        # 3. Sky replacement (optional, off by default)
         if replace_sky:
             win_mask = detect_window_mask_single(img)
             if win_mask.max() > 0.01:
@@ -911,8 +855,16 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
                 img = np.clip(img.astype(np.float32) * (1 - mask3) + sky * mask3, 0, 255).astype(np.uint8)
                 print("Sky replaced in window zones")
 
-        # 9. Clean finish (clarity + sharpen + dither — no CLAHE banding)
-        result = apply_autohdr_finish(img)
+        # 4. Light sharpen (BGR float32 — no LAB round-trip needed)
+        img_f = img.astype(np.float32)
+        blur_s = cv2.GaussianBlur(img_f, (0, 0), sigmaX=1.5, sigmaY=1.5)
+        img_f = np.clip(img_f + 0.3 * (img_f - blur_s), 0, 255)
+
+        # 5. Dither — ±1 noise breaks residual 8-bit gradient banding
+        noise = np.random.randint(-1, 2, img_f.shape[:2], dtype=np.int16)
+        img_f = np.clip(img_f + noise[:, :, None], 0, 255)
+
+        result = img_f.astype(np.uint8)
         print(f"Enhancement complete. Final: {result.shape[1]}×{result.shape[0]}")
         return result
     finally:
