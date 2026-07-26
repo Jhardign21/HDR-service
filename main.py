@@ -632,7 +632,7 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     # ── 1. Gentle CLAHE on L-channel (subtle contrast) ────────────────────────
     lab = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     l = clahe.apply(l)
     img_u8 = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
@@ -641,7 +641,7 @@ def apply_autohdr_finish(img_bgr: np.ndarray) -> np.ndarray:
     l_s, a_s, b_s = cv2.split(lab_sharp)
     laplacian = cv2.Laplacian(l_s, cv2.CV_64F, ksize=3)
     laplacian = np.clip(np.absolute(laplacian), 0, 255).astype(np.uint8)
-    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.10, 0)
+    l_s = cv2.addWeighted(l_s, 1.0, laplacian, 0.15, 0)
     img_u8 = cv2.cvtColor(cv2.merge((l_s, a_s, b_s)), cv2.COLOR_LAB2BGR)
 
     # ── 3. Bilateral denoise (clean up, keep hard edges) ──────────────────────
@@ -786,15 +786,46 @@ def pull_window_highlights(img_bgr: np.ndarray, win_mask: np.ndarray) -> np.ndar
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def lift_shadows(img_bgr: np.ndarray, threshold: float = 90.0, lift: float = 55.0) -> np.ndarray:
+    """
+    Lift deep shadows to create the bright, high-key real estate look.
+    Targets only dark L zones (below threshold) and lifts them proportionally —
+    midtones and highlights are untouched, so windows stay bright and white
+    ceilings stay clean. This is the 'Shadows' slider from Lightroom.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    shadow_mask = np.clip((threshold - l) / threshold, 0, 1) ** 1.2
+    lab[:, :, 0] = np.clip(l + shadow_mask * lift, 0, 255)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def add_clarity(img_bgr: np.ndarray, radius: float = 30.0, amount: float = 0.35) -> np.ndarray:
+    """
+    Large-radius unsharp mask on L-channel — the 'Clarity' slider from Lightroom.
+    Boosts midtone local contrast for that crisp, detailed real estate look
+    without affecting color. Gives texture pop to floors, furniture, plants.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0] / 255.0
+    blurred = cv2.GaussianBlur(l, (0, 0), sigmaX=radius, sigmaY=radius)
+    lab[:, :, 0] = np.clip(l + amount * (l - blurred), 0, 1) * 255.0
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
 def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
     """
-    Minimal enhancement for an already-merged HDR photo.
-    The source is already HDR — it just needs to be brightened and cleaned up.
-    No window masking, no highlight pulling, no sky replacement (by default).
+    High-key real estate enhancement for an already-merged HDR photo.
+    Produces the bright, airy, clean-white look typical of professional
+    real estate editing (flambient-style):
       1. Denoise
-      2. Lift exposure (underexposed → bright)
-      3. Very subtle white balance nudge
-      4. Clean finish (CLAHE + sharpen + denoise)
+      2. Aggressive exposure lift (high-key brightness)
+      3. Shadow lift (bright, airy interior — not crushed)
+      4. Subtle global white balance (neutral, slightly cool)
+      5. Clarity (midtone local contrast pop)
+      6. Sky replacement (optional, OFF by default)
+      7. Clean finish (CLAHE + sharpen + denoise)
+    No window masking, no highlight pulling — windows stay bright and natural.
     """
     ext = file_url.split("?")[0].rsplit(".", 1)[-1]
     ext = f".{ext.lower()}" if ext else ".jpg"
@@ -804,17 +835,24 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
         img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_AREA)
         print(f"Loaded single photo at {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}")
 
-        # 1. Denoise
+        # 1. Denoise (light, preserve edges)
         img = cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
 
-        # 2. Lift exposure (gently brighten the whole image)
-        img = lift_exposure(img, gamma=0.80)
+        # 2. Aggressive exposure lift — high-key real estate look
+        img = lift_exposure(img, gamma=0.62)
         print(f"Exposure lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
 
-        # 3. Very subtle white balance nudge (just 10% toward neutral)
+        # 3. Lift deep shadows — bright, airy interior (not crushed)
+        img = lift_shadows(img, threshold=90, lift=55)
+        print(f"Shadows lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+
+        # 4. Subtle global white balance (neutral, slightly cool)
         img = gentle_white_balance(img)
 
-        # 4. Sky replacement (optional, off by default)
+        # 5. Clarity — midtone local contrast pop
+        img = add_clarity(img, radius=30, amount=0.35)
+
+        # 6. Sky replacement (optional, off by default)
         if replace_sky:
             win_mask = detect_window_mask_single(img)
             if win_mask.max() > 0.01:
@@ -824,7 +862,7 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
                 img = np.clip(img, 0, 255).astype(np.uint8)
                 print("Sky replaced in window zones")
 
-        # 5. Clean finish
+        # 7. Clean finish (CLAHE + sharpen + denoise)
         return apply_autohdr_finish(img)
     finally:
         try: os.unlink(tmp)
