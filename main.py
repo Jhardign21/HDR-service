@@ -751,27 +751,50 @@ def generate_sky(h: int, w: int) -> np.ndarray:
     return np.clip(grad, 0, 255)
 
 
-def pull_window_highlights(img_bgr: np.ndarray, win_mask: np.ndarray) -> np.ndarray:
+def lift_exposure(img_bgr: np.ndarray, gamma: float = 0.82) -> np.ndarray:
     """
-    Pull down semi-blown window highlights to recover whatever detail exists.
-    Only affects bright zones inside the window mask.
+    Gentle gamma lift to brighten underexposed interiors.
+    gamma < 1 = brighter. 0.82 ≈ 1.2x midtone lift — subtle, natural.
+    """
+    f = img_bgr.astype(np.float32) / 255.0
+    lifted = np.clip(np.power(f, gamma), 0, 1) * 255.0
+    return lifted.astype(np.uint8)
+
+
+def gentle_white_balance(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Subtle GLOBAL white balance — gently nudges warm cast toward neutral.
+    No masking, no patchy artifacts. Uniform across the whole image.
+    Pulls b-channel (yellow) by 20%, a-channel (green/magenta) by 10%.
     """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    l = lab[:, :, 0]
-    bright = np.clip((l - 180) / (255 - 180 + 1e-6), 0, 1)
-    pull = win_mask * bright
-    lab[:, :, 0] = np.clip(l - pull * 55, 0, 255)
+    lab[:, :, 1] = lab[:, :, 1] * 0.90 + 128.0 * 0.10
+    lab[:, :, 2] = lab[:, :, 2] * 0.80 + 128.0 * 0.20
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
-def enhance_single(file_url: str, replace_sky: bool) -> np.ndarray:
+def pull_window_highlights(img_bgr: np.ndarray, win_mask: np.ndarray) -> np.ndarray:
     """
-    Enhance a single in-camera HDR photo:
+    Gently pull down blown window highlights to recover detail.
+    Much gentler than before — max 35-level pull, only on truly blown (L>220) zones.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    blown = np.clip((l - 220) / (255 - 220 + 1e-6), 0, 1)
+    pull = win_mask * blown
+    lab[:, :, 0] = np.clip(l - pull * 35, 0, 255)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
+    """
+    Simple, gentle enhancement for an already-merged HDR photo:
       1. Denoise
-      2. Detect blown window panes
-      3. Pull semi-blown highlights (recover detail)
-      4. Replace fully-blown panes with synthetic sky (optional)
-      5. Clean finish (CLAHE + sharpen + denoise)
+      2. Lift exposure (underexposed interiors → bright)
+      3. Gentle global white balance (remove warm cast, no patchy masks)
+      4. Gently pull blown window highlights (recover detail, no fake sky)
+      5. Sky replacement (optional, OFF by default — avoids muddy halos)
+      6. Clean finish (CLAHE + sharpen + denoise)
     """
     ext = file_url.split("?")[0].rsplit(".", 1)[-1]
     ext = f".{ext.lower()}" if ext else ".jpg"
@@ -784,24 +807,26 @@ def enhance_single(file_url: str, replace_sky: bool) -> np.ndarray:
         # 1. Denoise
         img = cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
 
-        # 2. Window mask
+        # 2. Lift exposure (gently brighten the whole image)
+        img = lift_exposure(img, gamma=0.82)
+        print(f"Exposure lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
+
+        # 3. Gentle global white balance (no masking → no patchy artifacts)
+        img = gentle_white_balance(img)
+
+        # 4. Window highlight recovery (gentle, only truly blown zones)
         win_mask = detect_window_mask_single(img)
-        print(f"Window mask: {win_mask.mean()*100:.1f}% of image")
+        if win_mask.max() > 0.01:
+            img = pull_window_highlights(img, win_mask)
+            print(f"Window highlights pulled. Mask: {win_mask.mean()*100:.1f}%")
 
-        # 3. Pull semi-blown highlights
-        img = pull_window_highlights(img, win_mask)
-
-        # 4. Sky replacement in fully-blown core
+        # 5. Sky replacement (optional, off by default)
         if replace_sky and win_mask.max() > 0.01:
             sky = generate_sky(OUTPUT_HEIGHT, OUTPUT_WIDTH)
             mask3 = win_mask[:, :, None]
             img = img.astype(np.float32) * (1 - mask3) + sky * mask3
             img = np.clip(img, 0, 255).astype(np.uint8)
             print("Sky replaced in window zones")
-
-        # 5. Ceiling & wall whitening — neutralize yellow cast on bright flat surfaces
-        print("Whitening ceilings/walls...")
-        img = intelligent_white_balance(img)
 
         # 6. Clean finish
         return apply_autohdr_finish(img)
@@ -813,7 +838,7 @@ def enhance_single(file_url: str, replace_sky: bool) -> np.ndarray:
 class EnhanceRequest(BaseModel):
     file_url: str
     bracket_name: str = "enhance"
-    replace_sky: bool = True
+    replace_sky: bool = False
 
 
 @app.post("/enhance")
