@@ -693,6 +693,155 @@ async def merge_hdr(req: MergeRequest):
         raise HTTPException(500, detail=f"{str(e)}\n\nTraceback:\n{tb}")
 
 
+# ---------------------------------------------------------------------------
+# SINGLE-PHOTO ENHANCEMENT (in-camera HDR → finished photo)
+# ---------------------------------------------------------------------------
+
+def detect_window_mask_single(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Detect blown window panes from a single photo.
+    In-camera HDR exposes the interior well but typically blows out windows.
+    Thresholding for near-clipped (L > 235) isolates window panes specifically —
+    ceilings/walls in a good in-camera HDR won't be clipped.
+    """
+    h, w = img_bgr.shape[:2]
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l = lab[:, :, 0].astype(np.float32)
+
+    # Blown core (no recoverable detail) → sky replacement target
+    blown = (l > 235).astype(np.uint8) * 255
+    # Close gaps across mullions / frame bars
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    closed = cv2.morphologyEx(blown, cv2.MORPH_CLOSE, kernel)
+    # Dilate slightly to cover the pane edge
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    closed = cv2.dilate(closed, dilate_k)
+
+    # Drop tiny reflections / keep real window panes
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(closed, 8)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    min_area = int((h * w) * 0.003)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            mask[labels == i] = 255
+
+    feathered = cv2.GaussianBlur(mask.astype(np.float32), (21, 21), 0)
+    return np.clip(feathered / 255.0, 0, 1)
+
+
+def generate_sky(h: int, w: int) -> np.ndarray:
+    """
+    Procedural natural blue sky: vertical gradient + soft clouds.
+    BGR float32 [0..255].
+    """
+    # Gradient: deeper blue at top → hazy light near horizon
+    top   = np.array([170, 130, 70], dtype=np.float32)    # BGR deep blue
+    horz  = np.array([225, 205, 185], dtype=np.float32)   # BGR warm haze
+    grad  = np.zeros((h, w, 3), dtype=np.float32)
+    ys    = np.linspace(0, 1, h)[:, None] ** 0.7
+    grad[:] = top * (1 - ys[:, :, None]) + horz * ys[:, :, None]
+
+    # Soft procedural clouds from blurred noise
+    noise = np.random.rand(h, w).astype(np.float32)
+    cloud = cv2.GaussianBlur(noise, (0, 0), sigmaX=w / 6)
+    cloud = (cloud - cloud.min()) / (cloud.max() - cloud.min() + 1e-6)
+    cloud = np.clip((cloud - 0.58) / 0.25, 0, 1)[:, :, None]
+    white = np.array([245, 245, 245], dtype=np.float32)
+    grad  = grad * (1 - cloud * 0.45) + white * (cloud * 0.45)
+    return np.clip(grad, 0, 255)
+
+
+def pull_window_highlights(img_bgr: np.ndarray, win_mask: np.ndarray) -> np.ndarray:
+    """
+    Pull down semi-blown window highlights to recover whatever detail exists.
+    Only affects bright zones inside the window mask.
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    bright = np.clip((l - 180) / (255 - 180 + 1e-6), 0, 1)
+    pull = win_mask * bright
+    lab[:, :, 0] = np.clip(l - pull * 55, 0, 255)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def enhance_single(file_url: str, replace_sky: bool) -> np.ndarray:
+    """
+    Enhance a single in-camera HDR photo:
+      1. Denoise
+      2. Detect blown window panes
+      3. Pull semi-blown highlights (recover detail)
+      4. Replace fully-blown panes with synthetic sky (optional)
+      5. Clean finish (CLAHE + sharpen + denoise)
+    """
+    ext = file_url.split("?")[0].rsplit(".", 1)[-1]
+    ext = f".{ext.lower()}" if ext else ".jpg"
+    tmp = download_file(file_url, ext)
+    try:
+        img = load_image_bgr(tmp)
+        img = cv2.resize(img, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_AREA)
+        print(f"Loaded single photo at {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}")
+
+        # 1. Denoise
+        img = cv2.bilateralFilter(img, d=5, sigmaColor=45, sigmaSpace=45)
+
+        # 2. Window mask
+        win_mask = detect_window_mask_single(img)
+        print(f"Window mask: {win_mask.mean()*100:.1f}% of image")
+
+        # 3. Pull semi-blown highlights
+        img = pull_window_highlights(img, win_mask)
+
+        # 4. Sky replacement in fully-blown core
+        if replace_sky and win_mask.max() > 0.01:
+            sky = generate_sky(OUTPUT_HEIGHT, OUTPUT_WIDTH)
+            mask3 = win_mask[:, :, None]
+            img = img.astype(np.float32) * (1 - mask3) + sky * mask3
+            img = np.clip(img, 0, 255).astype(np.uint8)
+            print("Sky replaced in window zones")
+
+        # 5. Ceiling & wall whitening — neutralize yellow cast on bright flat surfaces
+        print("Whitening ceilings/walls...")
+        img = intelligent_white_balance(img)
+
+        # 6. Clean finish
+        return apply_autohdr_finish(img)
+    finally:
+        try: os.unlink(tmp)
+        except Exception: pass
+
+
+class EnhanceRequest(BaseModel):
+    file_url: str
+    bracket_name: str = "enhance"
+    replace_sky: bool = True
+
+
+@app.post("/enhance")
+async def enhance_hdr(req: EnhanceRequest):
+    if not req.file_url:
+        raise HTTPException(400, "No file URL provided")
+    try:
+        print(f"Starting single-photo enhancement for '{req.bracket_name}'...")
+        result = enhance_single(req.file_url, req.replace_sky)
+
+        pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        del result; gc.collect()
+        buf = io.BytesIO()
+        pil.save(buf, format="JPEG", quality=94, optimize=True)
+        del pil; gc.collect()
+        buf.seek(0)
+        jpg_b64 = base64.b64encode(buf.read()).decode("utf-8")
+        del buf
+
+        return {"success": True, "bracket_name": req.bracket_name,
+                "width": OUTPUT_WIDTH, "height": OUTPUT_HEIGHT, "jpeg_base64": jpg_b64}
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"ERROR in /enhance: {tb}")
+        raise HTTPException(500, detail=f"{str(e)}\n\nTraceback:\n{tb}")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
