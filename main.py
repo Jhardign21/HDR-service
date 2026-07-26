@@ -825,12 +825,19 @@ def lr_whites_blacks(img_bgr: np.ndarray, white_push: float = 12.0,
 
 def lr_white_balance(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Subtle GLOBAL white balance — nudge toward neutral. No masking, no
-    patchy artifacts. Pulls b-channel (yellow) by 10%, a-channel by 5%.
+    Zone-targeted white balance — neutralizes green/yellow cast in BRIGHT
+    zones (ceilings, walls near windows) where window light introduces a
+    green tint. Dark zones (plants, furniture) keep their natural color.
+    Pulls a-channel (green) and b-channel (yellow) toward 128 by 75% in
+    L>160 areas, heavily feathered for smooth transitions.
     """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lab[:, :, 1] = lab[:, :, 1] * 0.95 + 128.0 * 0.05
-    lab[:, :, 2] = lab[:, :, 2] * 0.90 + 128.0 * 0.10
+    l = lab[:, :, 0]
+    bright_w = np.clip((l - 160.0) / 40.0, 0, 1)
+    bright_w = cv2.GaussianBlur(bright_w, (0, 0), sigmaX=15, sigmaY=15)
+    pull = 0.75
+    lab[:, :, 1] = lab[:, :, 1] * (1.0 - bright_w * pull) + 128.0 * (bright_w * pull)
+    lab[:, :, 2] = lab[:, :, 2] * (1.0 - bright_w * pull) + 128.0 * (bright_w * pull)
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
@@ -875,7 +882,7 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
         img = cv2.bilateralFilter(img, d=4, sigmaColor=30, sigmaSpace=30)
 
         # 2. Major exposure lift — high-key real estate look
-        img = lr_exposure(img, gamma=0.55)
+        img = lr_exposure(img, gamma=0.48)
         print(f"Exposure lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
 
         # 3. Lower highlights — recover window detail (masked, feathered)
@@ -883,17 +890,17 @@ def enhance_single(file_url: str, replace_sky: bool = False) -> np.ndarray:
         print(f"Highlights lowered. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
 
         # 4. Lift shadows — bright, airy interior (masked, feathered)
-        img = lr_shadows(img, threshold=80, lift=55)
+        img = lr_shadows(img, threshold=80, lift=65)
         print(f"Shadows lifted. Mean: {cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean():.1f}")
 
         # 5. Tweak whites & blacks — clean whites, no crushed blacks
-        img = lr_whites_blacks(img, white_push=12, black_lift=15)
+        img = lr_whites_blacks(img, white_push=18, black_lift=15)
 
-        # 6. Subtle white balance (neutral, slightly cool)
+        # 6. Zone-targeted white balance — kill green/yellow on ceilings, keep plants
         img = lr_white_balance(img)
 
-        # 7. Add saturation
-        img = lr_saturation(img, factor=1.15)
+        # 7. Add saturation — vibrant plants and furniture
+        img = lr_saturation(img, factor=1.30)
 
         # 8. Sky replacement (optional, off by default)
         if replace_sky:
